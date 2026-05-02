@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Send Python scripts and take screenshots on Evo
+"""Send Python scripts, OS images, and take screenshots on Evo
 
 Uses Kermit file transfer protocol over USB bulk transfers.
 
 Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --screenshot [output.png]
+       python3 evo_usb.py --send-os <os_bundle.bin>
+       python3 evo_usb.py --extract-os <capture.pcapng> [output.bin]
+       python3 evo_usb.py --get-info
+       python3 evo_usb.py --reboot
 """
 
 import struct
@@ -24,7 +28,6 @@ ctl = lambda x: x ^ 0x40
 
 
 def _encode_byte(b):
-    # Quote bytes whose low 7 bits are control (0x00-0x1F, 0x7F), plus the prefix chars
     if b & 0x7F < 0x20 or b & 0x7F == 0x7F:
         return bytes([QCTL, ctl(b)])
     if b == QCTL:
@@ -34,10 +37,16 @@ def _encode_byte(b):
     return bytes([b])
 
 
+def _unctl(b):
+    if (b & 0x7F) == 0x3F or (b & 0x60) == 0x40:
+        return b ^ 0x40
+    return b
+
+
 def _decode_byte(data, i):
     if data[i] == QCTL and i + 1 < len(data):
         nxt = data[i + 1]
-        return (nxt, 2) if nxt in (QCTL, REPT) else (ctl(nxt), 2)
+        return (_unctl(nxt), 2)
     return data[i], 1
 
 
@@ -49,7 +58,7 @@ def encode(data):
         while i + run < len(data) and data[i + run] == data[i] and run < 94:
             run += 1
         enc = _encode_byte(data[i])
-        if run >= 3 or (run >= 2 and len(enc) > 1):
+        if run >= 3:
             out.append(REPT)
             out.append(tochar(run))
             out.extend(enc)
@@ -142,11 +151,20 @@ def release(dev):
             pass
 
 
-def send_pkt(dev, seq, ptype, data=b""):
-    dev.write(EP_OUT, make_packet(seq, ptype, data), timeout=TIMEOUT)
-    _, rtype, _ = parse_packet(bytes(dev.read(EP_IN, 4096, timeout=TIMEOUT)))
-    if rtype != "Y":
-        raise RuntimeError(f"expected ACK, got {rtype}")
+def send_pkt(dev, seq, ptype, data=b"", timeout=TIMEOUT):
+    pkt = make_packet(seq, ptype, data)
+    for attempt in range(3):
+        dev.write(EP_OUT, pkt, timeout=timeout)
+        _, rtype, rdata = parse_packet(bytes(dev.read(EP_IN, 4096, timeout=timeout)))
+        if rtype == "Y":
+            return rdata
+        # NAK — flush stale data and retry
+        try:
+            while True:
+                dev.read(EP_IN, 4096, timeout=100)
+        except Exception:
+            pass
+    raise RuntimeError(f"packet {ptype} seq {seq} NAK'd after 3 retries")
 
 
 def recv_pkt(dev):
@@ -354,11 +372,370 @@ def take_screenshot(output="screenshot.png"):
         release(dev)
 
 
+def get_device_info():
+    url = "hh01/get/hh01/sys/attributes"
+    attrs = file_attr('"', "B8") + file_attr("1", "1") + file_attr("@")
+
+    dev = connect()
+    try:
+        seq = 0
+        send_pkt(dev, seq, "S", S_INIT)
+        seq += 1
+        send_pkt(dev, seq, "F", url.encode())
+        seq += 1
+        send_pkt(dev, seq, "A", attrs)
+        seq += 1
+        send_pkt(dev, seq, "D", b"\x68")
+        seq += 1
+        send_pkt(dev, seq, "Z")
+        seq += 1
+        send_pkt(dev, seq, "B")
+
+        rseq, rtype, rdata = recv_pkt(dev)
+        if rtype != "S":
+            raise RuntimeError(f"expected S, got {rtype}")
+        ack(dev, rseq, rdata)
+
+        for expected in ("F", "A"):
+            rseq, rtype, rdata = recv_pkt(dev)
+            if rtype != expected:
+                raise RuntimeError(f"expected {expected}, got {rtype}")
+            ack(dev, rseq)
+
+        chunks = []
+        while True:
+            rseq, rtype, rdata = recv_pkt(dev)
+            ack(dev, rseq)
+            if rtype == "Z":
+                break
+            chunks.append(rdata)
+
+        rseq, rtype, rdata = recv_pkt(dev)
+        if rtype == "B":
+            ack(dev, rseq)
+
+        raw = decode(b"".join(chunks))
+        return parse_cbor_info(raw)
+    finally:
+        release(dev)
+
+
+def parse_cbor_info(data):
+    info = {}
+    i = 0
+    if i >= len(data):
+        return info
+    count = data[i] & 0x1F
+    i += 1
+    for _ in range(count if count < 0x1F else 256):
+        if i >= len(data):
+            break
+        klen = data[i] & 0x1F
+        i += 1
+        key = data[i : i + klen].decode("ascii", errors="replace")
+        i += klen
+        if i >= len(data):
+            break
+        vtype = data[i] >> 5
+        vinfo = data[i] & 0x1F
+        if vtype == 3:  # text
+            i += 1
+            val = data[i : i + vinfo].decode("ascii", errors="replace")
+            i += vinfo
+        elif vtype == 0:  # uint
+            if vinfo < 24:
+                val = vinfo
+                i += 1
+            elif vinfo == 24:
+                val = data[i + 1]
+                i += 2
+            elif vinfo == 25:
+                val = struct.unpack(">H", data[i + 1 : i + 3])[0]
+                i += 3
+            elif vinfo == 26:
+                val = struct.unpack(">I", data[i + 1 : i + 5])[0]
+                i += 5
+            else:
+                break
+        elif vtype == 1:  # negative int
+            if vinfo < 24:
+                val = -(vinfo + 1)
+                i += 1
+            else:
+                break
+        else:
+            break
+        info[key] = val
+    return info
+
+
+OS_MAGIC = 0x96F3B83D
+
+
+def parse_os_header(data):
+    if len(data) < 32:
+        return None
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic != OS_MAGIC:
+        return None
+    data_offset = struct.unpack_from("<H", data, 8)[0]
+    section_type = struct.unpack_from("<H", data, 10)[0]
+    data_size = struct.unpack_from("<I", data, 12)[0]
+    ver_major = struct.unpack_from("<I", data, 20)[0]
+    ver_build = struct.unpack_from("<I", data, 24)[0]
+    return {
+        "data_offset": data_offset,
+        "section_type": section_type,
+        "data_size": data_size,
+        "version": f"{ver_major}.0.0.{ver_build}",
+    }
+
+
+def parse_os_bundle(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    return parse_os_bundle_data(data)
+
+
+def extract_os_from_pcapng(pcapng_path, output_path=None):
+    import subprocess
+
+    result = subprocess.run(
+        [
+            "tshark",
+            "-r",
+            pcapng_path,
+            "-Y",
+            "usb.endpoint_address == 0x01",
+            "-T",
+            "fields",
+            "-e",
+            "usb.capdata",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    buf = bytearray()
+    s_count = 0
+    d_payloads = []
+    url = None
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        raw = bytes.fromhex(line.replace(":", ""))
+        buf.extend(raw)
+        while True:
+            if SOH not in buf:
+                break
+            soh_idx = buf.index(SOH)
+            cr_idx = -1
+            for i in range(soh_idx + 3, len(buf)):
+                if buf[i] == CR:
+                    cr_idx = i
+                    break
+            if cr_idx == -1:
+                break
+            pkt_raw = bytes(buf[soh_idx : cr_idx + 1])
+            buf = bytearray(buf[cr_idx + 1 :])
+            body = pkt_raw[1:-1]
+            ext = body[0] == tochar(0)
+            ptype = chr(body[2])
+            pdata = body[6:-1] if ext else body[3:-1]
+            if ptype == "S":
+                s_count += 1
+            if s_count >= 2:
+                if ptype == "F" and url is None:
+                    url = pdata.decode("ascii", errors="replace")
+                if ptype == "D":
+                    d_payloads.append(pdata)
+
+    if not d_payloads:
+        sys.exit("no OS data found in pcapng")
+
+    wire = b"".join(d_payloads)
+    data = decode(wire)
+
+    if output_path is None:
+        _, sections, version = parse_os_bundle_data(data)
+        output_path = f"os-{version}.bin"
+
+    with open(output_path, "wb") as f:
+        f.write(data)
+
+    _, sections, version = parse_os_bundle_data(data)
+    type_names = {0x6B: "secure", 0x41: "os", 0x0C: "app"}
+    print(f"extracted {output_path} ({len(data)} bytes, v{version})")
+    for i, s in enumerate(sections):
+        tname = type_names.get(s["section_type"], f"0x{s['section_type']:02x}")
+        print(f"  [{i}] {tname}: {s['data_size']} bytes @ {s['offset']:#x}")
+    if url:
+        print(f"  url: {url}")
+
+
+def parse_os_bundle_data(data):
+    sections = []
+    magic_bytes = struct.pack("<I", OS_MAGIC)
+    off = 0
+    while off < len(data):
+        idx = data.find(magic_bytes, off)
+        if idx == -1:
+            break
+        hdr = parse_os_header(data[idx:])
+        if hdr:
+            hdr["offset"] = idx
+            sections.append(hdr)
+        off = idx + 32
+
+    version = sections[0]["version"] if sections else "0.0.0.0"
+    for s in sections:
+        if s["version"] > version:
+            version = s["version"]
+
+    return data, sections, version
+
+
+def send_os(path, prodnum=23):
+    data, sections, version = parse_os_bundle(path)
+
+    print(f"OS bundle: {path}")
+    print(f"  size: {len(data)} bytes")
+    print(f"  version: {version}")
+    print(f"  sections: {len(sections)}")
+    type_names = {0x6B: "secure", 0x41: "os", 0x0C: "app"}
+    for i, s in enumerate(sections):
+        tname = type_names.get(s["section_type"], f"0x{s['section_type']:02x}")
+        print(
+            f"    [{i}] {tname}: {s['data_size']} bytes @ {s['offset']:#x}, v{s['version']}"
+        )
+
+    print("  encoding...", end="", flush=True)
+    wire = encode(data)
+
+    wire_chunks = _split_element_aligned(wire)
+    total_encoded = sum(len(c) for c in wire_chunks)
+    print(f" {total_encoded} bytes, {len(wire_chunks)} chunks")
+
+    os_timeout = 30000
+    url = f"hh01/upd/pkg?bundle=1&prodnum={prodnum}&version={version}"
+    attrs = file_attr('"', "B8") + file_attr("1", str(len(data))) + file_attr("@")
+
+    dev = connect()
+    try:
+        seq = 0
+        send_pkt(dev, seq, "S", S_INIT, timeout=os_timeout)
+        seq += 1
+        send_pkt(dev, seq, "F", url.encode(), timeout=os_timeout)
+        seq += 1
+        send_pkt(dev, seq, "A", attrs, timeout=os_timeout)
+        seq += 1
+
+        total_chunks = len(wire_chunks)
+        for chunk_num, chunk in enumerate(wire_chunks, 1):
+            if chunk_num % 200 == 0 or chunk_num == total_chunks:
+                pct = chunk_num * 100 // total_chunks
+                print(
+                    f"\r  sending: {pct}% ({chunk_num}/{total_chunks})",
+                    end="",
+                    flush=True,
+                )
+            send_pkt(dev, seq, "D", chunk, timeout=os_timeout)
+            seq += 1
+
+        print()
+        send_pkt(dev, seq, "Z", timeout=os_timeout)
+        seq += 1
+        try:
+            send_pkt(dev, seq, "B", timeout=os_timeout)
+        except (RuntimeError, usb.core.USBError):
+            pass
+        print(f"sent OS bundle ({len(data)} bytes, {total_chunks} packets)")
+    finally:
+        release(dev)
+
+
+def _split_element_aligned(wire, chunk_size=2000):
+    chunks = []
+    pos = 0
+    chunk_start = 0
+    while pos < len(wire):
+        if wire[pos] == REPT and pos + 2 < len(wire):
+            pos += 2
+            if wire[pos] == QCTL and pos + 1 < len(wire):
+                pos += 2
+            else:
+                pos += 1
+        elif wire[pos] == QCTL and pos + 1 < len(wire):
+            pos += 2
+        else:
+            pos += 1
+        if pos - chunk_start >= chunk_size:
+            chunks.append(wire[chunk_start:pos])
+            chunk_start = pos
+    if chunk_start < len(wire):
+        chunks.append(wire[chunk_start : len(wire)])
+    return chunks
+
+
+def reboot():
+    url = "hh01/sys/reboot"
+    payload = b"\xf5"
+    wire = encode(payload)
+    attrs = file_attr('"', "B8") + file_attr("1", str(len(payload))) + file_attr("@")
+
+    dev = connect()
+    try:
+        seq = 0
+        for ptype, data in [
+            ("S", S_INIT),
+            ("F", url.encode()),
+            ("A", attrs),
+            ("D", wire),
+            ("Z", b""),
+            ("B", b""),
+        ]:
+            pkt = make_packet(seq, ptype, data)
+            dev.write(EP_OUT, pkt, timeout=TIMEOUT)
+            try:
+                _, rtype, _ = parse_packet(
+                    bytes(dev.read(EP_IN, 4096, timeout=TIMEOUT))
+                )
+                if rtype == "E":
+                    sys.exit(f"error response at {ptype} packet")
+            except (usb.core.USBTimeoutError, usb.core.USBError):
+                break
+            seq += 1
+    except usb.core.USBError:
+        pass
+    finally:
+        try:
+            release(dev)
+        except Exception:
+            pass
+    print("reboot command sent")
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(__doc__.strip())
     if sys.argv[1] == "--screenshot":
         take_screenshot(sys.argv[2] if len(sys.argv) > 2 else "screenshot.png")
+    elif sys.argv[1] == "--send-os":
+        if len(sys.argv) < 3:
+            sys.exit("usage: evo_usb.py --send-os <os_bundle.bin>")
+        send_os(sys.argv[2])
+    elif sys.argv[1] == "--extract-os":
+        if len(sys.argv) < 3:
+            sys.exit("usage: evo_usb.py --extract-os <capture.pcapng> [output.bin]")
+        output = sys.argv[3] if len(sys.argv) > 3 else None
+        extract_os_from_pcapng(sys.argv[2], output)
+    elif sys.argv[1] == "--get-info":
+        info = get_device_info()
+        for k, v in sorted(info.items()):
+            print(f"  {k}: {v}")
+    elif sys.argv[1] == "--reboot":
+        reboot()
     else:
         name = sys.argv[2] if len(sys.argv) > 2 else "pyscript"
         if len(name) > 8 or not all("a" <= c <= "z" for c in name):
