@@ -9,6 +9,10 @@ Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --extract-os <capture.pcapng> [output.bin]
        python3 evo_usb.py --get-info
        python3 evo_usb.py --reboot
+       python3 evo_usb.py --break
+       python3 evo_usb.py --list-files
+       python3 evo_usb.py --dynamic-info
+       python3 evo_usb.py --key <scancode>
 """
 
 import struct
@@ -372,8 +376,7 @@ def take_screenshot(output="screenshot.png"):
         release(dev)
 
 
-def get_device_info():
-    url = "hh01/get/hh01/sys/attributes"
+def _get_request(url):
     attrs = file_attr('"', "B8") + file_attr("1", "1") + file_attr("@")
 
     dev = connect()
@@ -414,10 +417,44 @@ def get_device_info():
         if rtype == "B":
             ack(dev, rseq)
 
-        raw = decode(b"".join(chunks))
-        return parse_cbor_info(raw)
+        return decode(b"".join(chunks))
     finally:
         release(dev)
+
+
+def get_device_info():
+    raw = _get_request("hh01/get/hh01/sys/attributes")
+    return parse_cbor_info(raw)
+
+
+def get_dynamic_info():
+    import cbor2
+
+    raw = _get_request("hh01/get/hh01/inf/res?name=dynamicinfo")
+    parsed = cbor2.loads(raw)
+    parsed.pop("metaData", None)
+    return parsed
+
+
+def list_files():
+    import cbor2
+
+    raw = _get_request("hh01/get/hh01/inf/res?name=directory&gotohome=1")
+    parsed = cbor2.loads(raw)
+    entries = []
+    for item in parsed.get("data", []):
+        name = item.get("dispName", item.get("tokName", b""))
+        if isinstance(name, bytes):
+            name = name.decode("ascii", errors="replace")
+        entries.append(
+            {
+                "name": name,
+                "type": item.get("type", 0),
+                "size": item.get("size", 0),
+                "mem": item.get("mem", False),
+            }
+        )
+    return entries
 
 
 def parse_cbor_info(data):
@@ -678,8 +715,7 @@ def _split_element_aligned(wire, chunk_size=2000):
     return chunks
 
 
-def reboot():
-    url = "hh01/sys/reboot"
+def _sys_command(url):
     payload = b"\xf5"
     wire = encode(payload)
     attrs = file_attr('"', "B8") + file_attr("1", str(len(payload))) + file_attr("@")
@@ -713,7 +749,48 @@ def reboot():
             release(dev)
         except Exception:
             pass
+
+
+def reboot():
+    _sys_command("hh01/sys/reboot")
     print("reboot command sent")
+
+
+def send_break():
+    _sys_command("hh01/sys/break")
+    print("break sent")
+
+
+def send_scancode(sc):
+    if sc < 24:
+        payload = bytes([0x9F, sc, 0xFF])
+    else:
+        payload = bytes([0x9F, 0x18, sc, 0xFF])
+    wire = encode(payload)
+    attrs = file_attr('"', "B8") + file_attr("1", str(len(payload))) + file_attr("@")
+
+    dev = connect()
+    try:
+        seq = 0
+        for ptype, data in [
+            ("S", S_INIT),
+            ("F", b"hh01/sys/scancode"),
+            ("A", attrs),
+            ("D", wire),
+            ("Z", b""),
+            ("B", b""),
+        ]:
+            pkt = make_packet(seq, ptype, data)
+            dev.write(EP_OUT, pkt, timeout=TIMEOUT)
+            _, rtype, _ = parse_packet(bytes(dev.read(EP_IN, 4096, timeout=TIMEOUT)))
+            if rtype == "E":
+                raise RuntimeError(f"scancode {sc}: error at {ptype} packet")
+            seq += 1
+    finally:
+        try:
+            release(dev)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -736,6 +813,22 @@ if __name__ == "__main__":
             print(f"  {k}: {v}")
     elif sys.argv[1] == "--reboot":
         reboot()
+    elif sys.argv[1] == "--break":
+        send_break()
+    elif sys.argv[1] == "--list-files":
+        for f in list_files():
+            loc = "RAM" if f.get("mem") else "ARC"
+            print(
+                f"  {f['name']:20s} type={f.get('type',0):2d}  size={f.get('size',0):8d}  {loc}"
+            )
+    elif sys.argv[1] == "--dynamic-info":
+        info = get_dynamic_info()
+        for k, v in sorted(info.items()):
+            print(f"  {k}: {v}")
+    elif sys.argv[1] == "--key":
+        if len(sys.argv) < 3:
+            sys.exit("usage: evo_usb.py --key <scancode>")
+        send_scancode(int(sys.argv[2], 0))
     else:
         name = sys.argv[2] if len(sys.argv) > 2 else "pyscript"
         if len(name) > 8 or not all("a" <= c <= "z" for c in name):
