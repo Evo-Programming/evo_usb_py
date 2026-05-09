@@ -3,7 +3,7 @@
 
 https://github.com/Evo-Programming/evo_usb_py
 
-Uses Kermit file transfer protocol over USB bulk transfers (serial device directly when appropriate)
+Uses Kermit file transfer protocol over the serial device exposed by the calculator.
 
 Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --screenshot [output.png] [mode]
@@ -31,8 +31,6 @@ import sys
 import time
 import zlib
 
-usb = None
-
 
 class TransportTimeout(TimeoutError):
     pass
@@ -42,9 +40,9 @@ class TransportError(OSError):
     pass
 
 
-USB_ERROR_EXCEPTIONS = (TransportError, OSError)
-USB_TIMEOUT_EXCEPTIONS = (TransportTimeout, TimeoutError)
-TRANSFER_ERROR_EXCEPTIONS = (RuntimeError, TransportError, OSError)
+TRANSPORT_ERROR_EXCEPTIONS = (TransportError, OSError)
+TRANSPORT_TIMEOUT_EXCEPTIONS = (TransportTimeout, TimeoutError)
+TRANSFER_ERROR_EXCEPTIONS = (RuntimeError,) + TRANSPORT_ERROR_EXCEPTIONS
 
 # --- Kermit encoding primitives ---
 
@@ -184,12 +182,9 @@ def transfer_error_text(data):
     return data.hex()
 
 
-# --- USB transport ---
+# --- Serial transport ---
 
-VID, PID = 0x0451, 0xE018
-USB_INTERFACE = 1
-USB_ALT_SETTING = 0
-EP_OUT, EP_IN = 0x01, 0x82
+TI_VID, EVO_PID = 0x0451, 0xE018
 TIMEOUT = 5000
 
 # MAXL=94 TIME=16 NPAD=0 PADC=NUL EOL=CR QCTL=# QBIN=Y CHKT=1 REPT=~ CAPAS=0x0E WINDO=2 MAXLX=2040
@@ -225,32 +220,13 @@ XFR_RESULT_MESSAGES = {
 }
 
 
-class USBConnection:
-    def __init__(self, dev, interface_number, ep_out, ep_in, detached_interfaces):
-        self.dev = dev
-        self.interface_number = interface_number
-        self.ep_out = ep_out
-        self.ep_in = ep_in
-        self.detached_interfaces = detached_interfaces
-
-    def write(self, endpoint, data, timeout=None):
-        if endpoint == EP_OUT:
-            endpoint = self.ep_out
-        return self.dev.write(endpoint, data, timeout=timeout)
-
-    def read(self, endpoint, size_or_buffer, timeout=None):
-        if endpoint == EP_IN:
-            endpoint = self.ep_in
-        return self.dev.read(endpoint, size_or_buffer, timeout=timeout)
-
-
-class SerialConnection:
+class PosixSerialConnection:
     def __init__(self, path, fd):
         self.path = path
         self.fd = fd
         self._rx = bytearray()
 
-    def write(self, endpoint, data, timeout=None):
+    def write(self, data, timeout=None):
         deadline = _deadline(timeout)
         view = memoryview(data)
         total = 0
@@ -269,7 +245,7 @@ class SerialConnection:
                 raise TransportError(e.errno, f"{self.path}: {e.strerror}") from e
         return total
 
-    def read(self, endpoint, size_or_buffer, timeout=None):
+    def read(self, timeout=None):
         deadline = _deadline(timeout)
         while True:
             if CR in self._rx:
@@ -294,6 +270,65 @@ class SerialConnection:
                 continue
             self._rx.extend(chunk)
 
+    def close(self):
+        os.close(self.fd)
+
+
+class PySerialConnection:
+    def __init__(self, serial_module, port):
+        self.serial_module = serial_module
+        self.port = port
+        self.path = port.port
+        self._rx = bytearray()
+
+    def write(self, data, timeout=None):
+        old_timeout = self.port.write_timeout
+        self.port.write_timeout = (timeout if timeout is not None else TIMEOUT) / 1000
+        try:
+            written = self.port.write(data)
+            self.port.flush()
+        except self.serial_module.SerialTimeoutException as e:
+            raise TransportTimeout(f"serial write timed out on {self.path}") from e
+        except self.serial_module.SerialException as e:
+            raise TransportError(f"{self.path}: {e}") from e
+        finally:
+            self.port.write_timeout = old_timeout
+        if written != len(data):
+            raise TransportTimeout(f"serial write timed out on {self.path}")
+        return written
+
+    def read(self, timeout=None):
+        old_timeout = self.port.timeout
+        deadline = _deadline(timeout)
+        try:
+            while True:
+                if CR in self._rx:
+                    idx = self._rx.index(CR) + 1
+                    pkt = bytes(self._rx[:idx])
+                    del self._rx[:idx]
+                    return pkt
+
+                remaining = _remaining(deadline)
+                if remaining <= 0:
+                    raise TransportTimeout(f"serial read timed out on {self.path}")
+                self.port.timeout = remaining
+                try:
+                    waiting = self.port.in_waiting
+                    chunk = self.port.read(waiting if waiting else 1)
+                except self.serial_module.SerialException as e:
+                    raise TransportError(f"{self.path}: {e}") from e
+                if not chunk:
+                    raise TransportTimeout(f"serial read timed out on {self.path}")
+                self._rx.extend(chunk)
+        finally:
+            self.port.timeout = old_timeout
+
+    def close(self):
+        try:
+            self.port.close()
+        except self.serial_module.SerialException as e:
+            raise TransportError(f"{self.path}: {e}") from e
+
 
 def _deadline(timeout):
     return time.monotonic() + ((timeout if timeout is not None else TIMEOUT) / 1000)
@@ -303,27 +338,18 @@ def _remaining(deadline):
     return max(0, deadline - time.monotonic())
 
 
-def _require_pyusb():
-    global usb, USB_ERROR_EXCEPTIONS, USB_TIMEOUT_EXCEPTIONS, TRANSFER_ERROR_EXCEPTIONS
-    if usb is not None:
-        return
+def _require_pyserial():
     try:
-        import usb as usb_pkg
-        import usb.core
-        import usb.util
+        import serial
+        import serial.tools.list_ports
     except ModuleNotFoundError as e:
-        if e.name == "usb":
+        if e.name == "serial":
             sys.exit(
-                "PyUSB is required for USB operations.\n"
-                "Install it with: python3 -m pip install pyusb\n"
-                "With Homebrew Python, use a virtualenv instead:\n"
-                "  python3 -m venv .venv && .venv/bin/python -m pip install pyusb"
+                "pyserial is required for serial access on Windows.\n"
+                "Install it with: py -m pip install pyserial"
             )
         raise
-    usb = usb_pkg
-    USB_ERROR_EXCEPTIONS = (TransportError, OSError, usb.core.USBError)
-    USB_TIMEOUT_EXCEPTIONS = (TransportTimeout, TimeoutError, usb.core.USBTimeoutError)
-    TRANSFER_ERROR_EXCEPTIONS = (RuntimeError,) + USB_ERROR_EXCEPTIONS
+    return serial
 
 
 def _serial_paths():
@@ -340,7 +366,66 @@ def _serial_paths():
     )
 
 
+def _pyserial_paths(serial_module):
+    configured = os.environ.get("EVO_USB_SERIAL")
+    if configured:
+        return [configured]
+
+    matches = []
+    fallback = []
+    for port in serial_module.tools.list_ports.comports():
+        device = port.device
+        fallback.append(device)
+        text = " ".join(
+            str(value)
+            for value in (
+                port.description,
+                port.manufacturer,
+                port.product,
+                port.hwid,
+            )
+            if value
+        )
+        if (
+            (getattr(port, "vid", None), getattr(port, "pid", None))
+            == (TI_VID, EVO_PID)
+            or "Texas Instruments" in text
+            or "TI-84" in text
+        ):
+            matches.append(device)
+
+    return matches or fallback
+
+
+def _connect_pyserial():
+    serial_module = _require_pyserial()
+    paths = _pyserial_paths(serial_module)
+    if not paths:
+        raise RuntimeError("no Evo CDC serial device found; set EVO_USB_SERIAL=COMx")
+
+    last_error = None
+    for path in paths:
+        try:
+            port = serial_module.Serial(
+                path,
+                baudrate=115200,
+                timeout=0,
+                write_timeout=TIMEOUT / 1000,
+            )
+            port.reset_input_buffer()
+            port.reset_output_buffer()
+            return PySerialConnection(serial_module, port)
+        except serial_module.SerialException as e:
+            last_error = e
+
+    detail = f": {last_error}" if last_error is not None else ""
+    raise RuntimeError(f"could not open any Evo serial device{detail}")
+
+
 def _connect_serial():
+    if platform.system() == "Windows":
+        return _connect_pyserial()
+
     import termios
 
     paths = _serial_paths()
@@ -366,7 +451,7 @@ def _connect_serial():
             except Exception:
                 os.close(fd)
                 raise
-            return SerialConnection(path, fd)
+            return PosixSerialConnection(path, fd)
         except OSError as e:
             last_error = e
 
@@ -374,141 +459,25 @@ def _connect_serial():
     raise RuntimeError(f"could not open any Evo serial device{detail}")
 
 
-def _detach_kernel_driver(dev, interface_number):
-    try:
-        if dev.is_kernel_driver_active(interface_number):
-            dev.detach_kernel_driver(interface_number)
-            return True
-    except (AttributeError, NotImplementedError) + USB_ERROR_EXCEPTIONS:
-        pass
-    return False
-
-
-def _set_configuration(dev):
-    try:
-        return dev.get_active_configuration()
-    except (NotImplementedError,) + USB_ERROR_EXCEPTIONS:
-        pass
-
-    try:
-        dev.set_configuration()
-        return dev.get_active_configuration()
-    except USB_ERROR_EXCEPTIONS as e:
-        sys.exit(f"could not configure USB device: {e}")
-
-
-def _bulk_pair(interface):
-    out_ep = usb.util.find_descriptor(
-        interface,
-        custom_match=lambda e: (
-            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK
-        ),
-    )
-    in_ep = usb.util.find_descriptor(
-        interface,
-        custom_match=lambda e: (
-            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
-            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK
-        ),
-    )
-    if out_ep is None or in_ep is None:
-        return None
-    return out_ep.bEndpointAddress, in_ep.bEndpointAddress
-
-
-def _transfer_interface(dev):
-    cfg = _set_configuration(dev)
-    candidates = []
-    seen = set()
-
-    try:
-        candidates.append(cfg[(USB_INTERFACE, USB_ALT_SETTING)])
-    except (IndexError, KeyError, TypeError):
-        pass
-
-    for interface in cfg:
-        key = (
-            interface.bInterfaceNumber,
-            getattr(interface, "bAlternateSetting", USB_ALT_SETTING),
-        )
-        if key not in seen:
-            candidates.append(interface)
-            seen.add(key)
-
-    for interface in candidates:
-        pair = _bulk_pair(interface)
-        if pair is not None:
-            return interface.bInterfaceNumber, pair[0], pair[1]
-
-    raise RuntimeError("could not find Evo USB bulk transfer interface")
-
-
 def connect():
-    if platform.system() != "Windows":
-        try:
-            return _connect_serial()
-        except RuntimeError as e:
-            sys.exit(str(e))
-
-    _require_pyusb()
-    find_args = {"idVendor": VID, "idProduct": PID}
-    dev = usb.core.find(**find_args)
-    if dev is None:
-        sys.exit(f"device {VID:04x}:{PID:04x} not found")
-
-    detached_interfaces = {
-        intf for intf in (0, 1) if _detach_kernel_driver(dev, intf)
-    }
-    interface_number, ep_out, ep_in = _transfer_interface(dev)
-
     try:
-        usb.util.claim_interface(dev, interface_number)
-    except USB_ERROR_EXCEPTIONS as e:
-        sys.exit(f"could not claim USB interface {interface_number}: {e}")
-
-    conn = USBConnection(dev, interface_number, ep_out, ep_in, detached_interfaces)
-    while True:
-        try:
-            conn.read(EP_IN, 4096, timeout=100)
-        except USB_TIMEOUT_EXCEPTIONS:
-            break
-    return conn
+        return _connect_serial()
+    except RuntimeError as e:
+        sys.exit(str(e))
 
 
 def release(conn):
-    if isinstance(conn, SerialConnection):
-        try:
-            os.close(conn.fd)
-        except OSError:
-            pass
-        return
-
-    dev = conn.dev if isinstance(conn, USBConnection) else conn
-    interface_number = (
-        conn.interface_number if isinstance(conn, USBConnection) else USB_INTERFACE
-    )
-    detached_interfaces = (
-        conn.detached_interfaces if isinstance(conn, USBConnection) else {0, 1}
-    )
-
     try:
-        usb.util.release_interface(dev, interface_number)
-    except USB_ERROR_EXCEPTIONS:
+        conn.close()
+    except TRANSPORT_ERROR_EXCEPTIONS:
         pass
-
-    for intf in detached_interfaces:
-        try:
-            dev.attach_kernel_driver(intf)
-        except (AttributeError, NotImplementedError) + USB_ERROR_EXCEPTIONS:
-            pass
 
 
 def send_pkt(dev, seq, ptype, data=b"", timeout=TIMEOUT):
     pkt = make_packet(seq, ptype, data)
     for attempt in range(3):
-        dev.write(EP_OUT, pkt, timeout=timeout)
-        _, rtype, rdata = parse_packet(bytes(dev.read(EP_IN, 4096, timeout=timeout)))
+        dev.write(pkt, timeout=timeout)
+        _, rtype, rdata = parse_packet(bytes(dev.read(timeout=timeout)))
         if rtype == "Y":
             return rdata
         if rtype == "E":
@@ -516,18 +485,18 @@ def send_pkt(dev, seq, ptype, data=b"", timeout=TIMEOUT):
         # NAK — flush stale data and retry
         try:
             while True:
-                dev.read(EP_IN, 4096, timeout=100)
+                dev.read(timeout=100)
         except Exception:
             pass
     raise RuntimeError(f"packet {ptype} seq {seq} NAK'd after 3 retries")
 
 
 def recv_pkt(dev):
-    return parse_packet(bytes(dev.read(EP_IN, 4096, timeout=TIMEOUT)))
+    return parse_packet(bytes(dev.read(timeout=TIMEOUT)))
 
 
 def ack(dev, seq, data=b""):
-    dev.write(EP_OUT, make_packet(seq, "Y", data), timeout=TIMEOUT)
+    dev.write(make_packet(seq, "Y", data), timeout=TIMEOUT)
 
 
 # --- Kermit file attributes ---
@@ -1381,17 +1350,17 @@ def _sys_command(url):
             ("B", b""),
         ]:
             pkt = make_packet(seq, ptype, data)
-            dev.write(EP_OUT, pkt, timeout=TIMEOUT)
+            dev.write(pkt, timeout=TIMEOUT)
             try:
                 _, rtype, rdata = parse_packet(
-                    bytes(dev.read(EP_IN, 4096, timeout=TIMEOUT))
+                    bytes(dev.read(timeout=TIMEOUT))
                 )
                 if rtype == "E":
                     sys.exit(f"error response at {ptype} packet: {transfer_error_text(rdata)}")
-            except USB_TIMEOUT_EXCEPTIONS + USB_ERROR_EXCEPTIONS:
+            except TRANSPORT_TIMEOUT_EXCEPTIONS + TRANSPORT_ERROR_EXCEPTIONS:
                 break
             seq += 1
-    except USB_ERROR_EXCEPTIONS:
+    except TRANSPORT_ERROR_EXCEPTIONS:
         pass
     finally:
         try:
@@ -1430,8 +1399,8 @@ def send_scancode(sc):
             ("B", b""),
         ]:
             pkt = make_packet(seq, ptype, data)
-            dev.write(EP_OUT, pkt, timeout=TIMEOUT)
-            _, rtype, rdata = parse_packet(bytes(dev.read(EP_IN, 4096, timeout=TIMEOUT)))
+            dev.write(pkt, timeout=TIMEOUT)
+            _, rtype, rdata = parse_packet(bytes(dev.read(timeout=TIMEOUT)))
             if rtype == "E":
                 raise RuntimeError(f"scancode {sc}: error at {ptype} packet: {transfer_error_text(rdata)}")
             seq += 1

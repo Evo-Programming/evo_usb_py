@@ -7,7 +7,9 @@ Uses Kermit file transfer protocol over the serial device exposed by the calcula
 You may have to adjust your permissions for serial access:  
 - On Linux, that generally means `usermod -a -G dialout $USER` and re-login for changes to take effect.  
 - On macOS (`/dev/cu.usbmodem*`) it should be usable right away.
-- On Windows (some `COM` port), it should also be fine by default.
+- On Windows, install pyserial with `py -m pip install pyserial`; the calculator should appear as a `COM` port.
+
+If auto-detection does not pick the right serial device, set `EVO_USB_SERIAL` to the path or port name, for example `/dev/cu.usbmodemRTX_DUMMY1` or `/dev/ttyACM0` or `COM3`.
 
 ```bash
 Usage: python3 evo_usb.py ...
