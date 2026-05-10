@@ -20,7 +20,7 @@ Usage: python3 evo_usb.py ...
   --send-file <file> [auto|ram|archive]
   --get-file <name> [type] [output]
   --delete-file <name> [type]
-  --send-os <os_bundle.bin>
+  --send-os <os_bundle.83b2|84b2|84tb2>
   --extract-os <capture.pcapng> [output.bin]
   --get-info
   --dynamic-info

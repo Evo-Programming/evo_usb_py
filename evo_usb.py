@@ -10,7 +10,7 @@ Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --send-file <file> [auto|ram|archive]
        python3 evo_usb.py --get-file <name> [type] [output]
        python3 evo_usb.py --delete-file <name> [type]
-       python3 evo_usb.py --send-os <os_bundle.bin>
+       python3 evo_usb.py --send-os <os_bundle.83b2|84b2|84tb2>
        python3 evo_usb.py --extract-os <capture.pcapng> [output.bin]
        python3 evo_usb.py --get-info
        python3 evo_usb.py --reboot
@@ -29,6 +29,7 @@ import select
 import struct
 import sys
 import time
+import zipfile
 import zlib
 
 
@@ -145,7 +146,7 @@ def xfr_result_message(code):
 
 
 RAW_TRANSFER_ERROR_HINTS = {
-    "PM": "maybe invalid memory destination",
+    "PM": "maybe rejected data or invalid memory destination",
     "DP": "maybe rejected data or invalid memory destination",
     "ER": "unknown calculator error, maybe rejected data",
 }
@@ -1126,6 +1127,59 @@ def parse_cbor_info(data):
 
 OS_MAGIC = 0x96F3B83D
 
+OS_PRODUCTS = {
+    23: "TI-84 Evo",
+    24: "TI-83 Evo",
+    25: "TI-84 Evo-T",
+}
+
+OS_BUNDLE_PRODUCTS = {
+    ".84b2": 23,
+    ".83b2": 24,
+    ".84tb2": 25,
+}
+
+OS_EXTRACTED_PACKAGE_PRODUCTS = {
+    ".84pk2": 23,
+    ".83pk2": 24,
+    ".84tpk2": 25,
+}
+
+OS_SECTION_NAMES = {
+    0x6B: "secure",
+    0x41: "os_84",
+    0x51: "os_83",
+}
+
+OS_APP_NAMES_BY_PRODUCT = {
+    23: {
+        0xB1: "Conic",
+        0xB2: "Inequalz",
+        0xB3: "PolyRoot",
+        0xB4: "SysSolve",
+        0xB5: "Python",
+        0xB6: "Transfrm",
+    },
+    24: {
+        0xB1: "Conic",
+        0xB2: "EasyData",
+        0xB3: "Inequalz",
+        0xB4: "Periodic",
+        0xB5: "PolyRoot",
+        0xB6: "SysSolve",
+        0xB7: "Python",
+        0xB8: "Transfrm",
+    },
+    25: {
+        0xB1: "Conic",
+        0xB2: "Inequalz",
+        0xB3: "PolyRoot",
+        0xB4: "SysSolve",
+        0xB5: "Python",
+        0xB6: "Transfrm",
+    },
+}
+
 
 def parse_os_header(data):
     if len(data) < 32:
@@ -1146,10 +1200,137 @@ def parse_os_header(data):
     }
 
 
-def parse_os_bundle(path):
+def _parse_bundle_metadata(data):
+    text = data.decode("utf-8", errors="replace")
+    metadata = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def _read_os_bundle(path):
+    package_name = os.path.basename(path)
+    metadata = {}
+
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            if "METADATA" in names:
+                metadata = _parse_bundle_metadata(zf.read("METADATA"))
+            candidates = [
+                name
+                for name in names
+                if not name.endswith("/")
+                and os.path.basename(name) != "METADATA"
+                and os.path.splitext(name.lower())[1] in OS_EXTRACTED_PACKAGE_PRODUCTS
+            ]
+            if not candidates:
+                raise RuntimeError(f"no OS package found inside {path}")
+            package_name = candidates[0]
+            return zf.read(package_name), metadata, package_name
+
     with open(path, "rb") as f:
-        data = f.read()
-    return parse_os_bundle_data(data)
+        return f.read(), metadata, package_name
+
+
+def _infer_os_product(path, metadata, package_name):
+    ext = os.path.splitext(path.lower())[1]
+    if ext in OS_BUNDLE_PRODUCTS:
+        return OS_BUNDLE_PRODUCTS[ext], f"{ext} bundle extension"
+
+    metadata_prodnum = metadata.get("bundle_target_prodid")
+    if metadata_prodnum:
+        try:
+            return int(metadata_prodnum, 0), "bundle metadata"
+        except ValueError:
+            pass
+
+    for candidate in (package_name, path):
+        ext = os.path.splitext(candidate.lower())[1]
+        if ext in OS_EXTRACTED_PACKAGE_PRODUCTS:
+            return OS_EXTRACTED_PACKAGE_PRODUCTS[ext], f"{ext} extracted package extension"
+
+    raise RuntimeError(
+        f"could not determine target calculator model from {path}; "
+        "use a .84b2, .83b2, .84tb2 bundle or an extracted .84pk2, .83pk2, .84tpk2 package"
+    )
+
+
+def _product_name(prodnum):
+    return OS_PRODUCTS.get(prodnum, f"unknown product {prodnum}")
+
+
+def _connected_os_product():
+    product = get_device_info().get("product")
+    if product is None:
+        return None, None
+
+    text = str(product)
+    try:
+        prodnum = int(text.split("-", 1)[0], 0)
+    except ValueError:
+        return None, text
+    return prodnum, text
+
+
+def _warn_os_product_mismatch(expected_prodnum):
+    try:
+        actual_prodnum, product_text = _connected_os_product()
+    except (Exception, SystemExit) as e:
+        print(f"  warning: could not verify connected calculator product: {e}")
+        return
+
+    if actual_prodnum is None:
+        print(f"  warning: could not parse connected calculator product: {product_text}")
+        return
+
+    if actual_prodnum != expected_prodnum:
+        print(
+            "  warning: OS package targets "
+            f"{_product_name(expected_prodnum)} (prodnum {expected_prodnum}), "
+            "but connected calculator reports "
+            f"{_product_name(actual_prodnum)} (product {product_text})"
+        )
+
+
+def _infer_os_product_from_sections(sections):
+    for section in sections:
+        if section["section_type"] == 0x51:
+            return 24
+    return None
+
+
+def _infer_os_product_from_url(url):
+    if not url:
+        return None
+    marker = "prodnum="
+    idx = url.find(marker)
+    if idx == -1:
+        return None
+    value = url[idx + len(marker) :].split("&", 1)[0]
+    try:
+        return int(value, 0)
+    except ValueError:
+        return None
+
+
+def _os_section_name(data, section, prodnum=None):
+    section_type = section["section_type"]
+    if section_type != 0x0C:
+        return OS_SECTION_NAMES.get(section_type, f"0x{section_type:02x}")
+
+    payload_offset = section["offset"] + section["data_offset"]
+    if payload_offset >= len(data):
+        return "app"
+
+    app_id = data[payload_offset]
+    app_name = OS_APP_NAMES_BY_PRODUCT.get(prodnum, {}).get(app_id)
+    if app_name:
+        return f"{app_name} app"
+    return f"app 0x{app_id:02x}"
 
 
 def extract_os_from_pcapng(pcapng_path, output_path=None):
@@ -1220,10 +1401,10 @@ def extract_os_from_pcapng(pcapng_path, output_path=None):
         f.write(data)
 
     _, sections, version = parse_os_bundle_data(data)
-    type_names = {0x6B: "secure", 0x41: "os", 0x0C: "app"}
+    prodnum = _infer_os_product_from_url(url) or _infer_os_product_from_sections(sections)
     print(f"extracted {output_path} ({len(data)} bytes, v{version})")
     for i, s in enumerate(sections):
-        tname = type_names.get(s["section_type"], f"0x{s['section_type']:02x}")
+        tname = _os_section_name(data, s, prodnum)
         print(f"  [{i}] {tname}: {s['data_size']} bytes @ {s['offset']:#x}")
     if url:
         print(f"  url: {url}")
@@ -1251,19 +1432,25 @@ def parse_os_bundle_data(data):
     return data, sections, version
 
 
-def send_os(path, prodnum=23):
-    data, sections, version = parse_os_bundle(path)
+def send_os(path):
+    data, metadata, package_name = _read_os_bundle(path)
+    data, sections, version = parse_os_bundle_data(data)
+    prodnum, prodnum_source = _infer_os_product(path, metadata, package_name)
 
     print(f"OS bundle: {path}")
+    if package_name != os.path.basename(path):
+        print(f"  package: {package_name}")
     print(f"  size: {len(data)} bytes")
     print(f"  version: {version}")
+    print(f"  target: {_product_name(prodnum)} (prodnum {prodnum}, {prodnum_source})")
     print(f"  sections: {len(sections)}")
-    type_names = {0x6B: "secure", 0x41: "os", 0x0C: "app"}
     for i, s in enumerate(sections):
-        tname = type_names.get(s["section_type"], f"0x{s['section_type']:02x}")
+        tname = _os_section_name(data, s, prodnum)
         print(
             f"    [{i}] {tname}: {s['data_size']} bytes @ {s['offset']:#x}, v{s['version']}"
         )
+
+    _warn_os_product_mismatch(prodnum)
 
     print("  encoding...", end="", flush=True)
     wire = encode(data)
@@ -1440,7 +1627,7 @@ if __name__ == "__main__":
         delete_variable(sys.argv[2], type_id)
     elif sys.argv[1] == "--send-os":
         if len(sys.argv) < 3:
-            sys.exit("usage: evo_usb.py --send-os <os_bundle.bin>")
+            sys.exit("usage: evo_usb.py --send-os <os_bundle.83b2|84b2|84tb2>")
         send_os(sys.argv[2])
     elif sys.argv[1] == "--extract-os":
         if len(sys.argv) < 3:
