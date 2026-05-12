@@ -1644,7 +1644,7 @@ if __name__ == "__main__":
         send_break()
     elif sys.argv[1] == "--list-files":
         for f in list_files():
-            loc = "RAM" if f.get("mem") else "ARC"
+            loc = "ARC" if f.get("mem") else "RAM"
             print(
                 f"  {f['name']:20s} type={f.get('type',0):2d}  size={f.get('size',0):8d}  {loc}"
             )
