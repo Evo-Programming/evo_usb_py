@@ -15,11 +15,13 @@ If auto-detection does not pick the right serial device, set `EVO_USB_SERIAL` to
 Usage: python3 evo_usb.py ...
 
   <script.py> [varname]                       # to send a python script
-  --screenshot [output.png] [mode]            # 0=auto?, 1=no-cursor, 2=with-cursor
+  --screenshot [output.png] [mode]            # 0=system screen, 1=no-cursor, 2=with-cursor
   --list-files                                # to get names/type/size/memory
   --send-file <file> [auto|ram|archive]
   --get-file <name> [type] [output]
   --delete-file <name> [type]
+  --send-csv-list <csv> <name> [ram|archive] [overwrite|no-overwrite]
+  --send-csv-matrix <csv> <name> [ram|archive] [overwrite|no-overwrite]
   --send-os <os_bundle.83b2|84b2|84tb2>
   --extract-os <capture.pcapng> [output.bin]
   --get-info
@@ -30,3 +32,5 @@ Usage: python3 evo_usb.py ...
   --exit-ptt
   --key <scancode>
 ```
+
+CSV imports default to RAM and overwrite existing variables. List names may be `L1`-`L6` or a 1-5 character calculator list name; matrix names may be `A`-`J`.
