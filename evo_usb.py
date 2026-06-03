@@ -916,10 +916,7 @@ def _screen_url(mode):
 
 def take_screenshot(output="screenshot.png", mode=0):
     raw = _get_request(_screen_url(mode))
-
-    # CBOR pixel data: 0x5A = bytes with 4-byte length header
-    marker = raw.index(0x5A)
-    rgb565 = raw[marker + 5 : marker + 5 + 320 * 240 * 2]
+    rgb565 = screen_rgb565_from_payload(raw)
 
     try:
         from PIL import Image
@@ -939,6 +936,17 @@ def take_screenshot(output="screenshot.png", mode=0):
     except ImportError:
         save_rgb565_png(output, rgb565)
         print(f"screenshot saved to {output}")
+
+
+def screen_rgb565_from_payload(raw, width=320, height=240):
+    parsed = cbor_loads(raw)
+    rgb565 = parsed.get("data") if isinstance(parsed, dict) else None
+    expected = width * height * 2
+    if not isinstance(rgb565, bytes):
+        raise ValueError("screen payload did not contain a CBOR data byte string")
+    if len(rgb565) < expected:
+        raise ValueError(f"screen payload is too short: {len(rgb565)} bytes, expected {expected}")
+    return rgb565[:expected]
 
 
 def _get_request(url):
