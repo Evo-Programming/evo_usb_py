@@ -71,8 +71,8 @@ def _unctl(b):
     return b
 
 
-def _decode_byte(data, i):
-    if data[i] == QCTL and i + 1 < len(data):
+def _decode_byte(data, i, control_quote=QCTL):
+    if data[i] == control_quote and i + 1 < len(data):
         nxt = data[i + 1]
         return (_unctl(nxt), 2)
     return data[i], 1
@@ -96,20 +96,27 @@ def encode(data):
     return bytes(out)
 
 
-def decode(data):
+def decode(data, session=None):
+    control_quote = session.control_quote if session is not None else QCTL
+    binary_quote = session.binary_quote if session is not None else None
+    repeat_quote = session.repeat_quote if session is not None else REPT
     out = bytearray()
     i = 0
     while i < len(data):
-        if data[i] == REPT and i + 2 < len(data):
+        if data[i] == repeat_quote and i + 2 < len(data):
             count = unchar(data[i + 1])
             i += 2
-            b, skip = _decode_byte(data, i)
-            i += skip
-            out.extend([b] * count)
         else:
-            b, skip = _decode_byte(data, i)
-            i += skip
-            out.append(b)
+            count = 1
+        high_bit = 0
+        if binary_quote is not None and i < len(data) and data[i] == binary_quote:
+            high_bit = 0x80
+            i += 1
+        if i >= len(data):
+            break
+        b, skip = _decode_byte(data, i, control_quote)
+        i += skip
+        out.extend([b | high_bit] * count)
     return bytes(out)
 
 
@@ -170,7 +177,7 @@ class KermitSession:
     def update_from_send_init(self, data):
         if len(data) > 5 and data[5] != 0x20:
             self.control_quote = data[5]
-        if len(data) > 6 and data[6] not in (ord("N"), 0x20):
+        if len(data) > 6 and data[6] not in (ord("Y"), ord("N"), 0x20):
             self.binary_quote = data[6]
         if len(data) > 7 and chr(data[7]) in "123":
             self.check_type = int(chr(data[7]))
@@ -976,7 +983,7 @@ def _get_request(url):
         if rtype == "B":
             ack(dev, rseq, session=session)
 
-        return decode(b"".join(chunks))
+        return decode(b"".join(chunks), session=session)
     finally:
         release(dev)
 
