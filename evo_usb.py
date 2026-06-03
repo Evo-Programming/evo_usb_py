@@ -572,6 +572,50 @@ def token_encode_name(name):
     return bytes(out)
 
 
+def _token_words(name_bytes):
+    words = []
+    for i in range(0, len(name_bytes), 2):
+        if i + 1 >= len(name_bytes):
+            break
+        word = name_bytes[i] | (name_bytes[i + 1] << 8)
+        if word == 0:
+            break
+        words.append(word)
+    return words
+
+
+def _decode_custom_name(name_bytes):
+    chars = []
+    for word in _token_words(name_bytes):
+        if 0xE800 <= word <= 0xE819:
+            chars.append(chr(ord("A") + word - 0xE800))
+        elif 0x0061 <= word <= 0x007A:
+            chars.append(chr(word))
+        elif 0x0041 <= word <= 0x005A:
+            chars.append(chr(word))
+        elif 0x0030 <= word <= 0x0039:
+            chars.append(chr(word))
+        elif word == 0x005F:
+            chars.append("_")
+        else:
+            return None
+    return "".join(chars) if chars else None
+
+
+COMMON_TOKEN_NAMES = {
+    0: {**{0xE800 + i: chr(ord("A") + i) for i in range(26)}, 0xE81A: "theta"},
+    1: {0xE830 + i: f"L{i + 1}" for i in range(6)},
+    3: {0xE899: "GDB0", **{0xE890 + i: f"GDB{i + 1}" for i in range(9)}},
+    4: {0xE889: "Pic0", **{0xE880 + i: f"Pic{i + 1}" for i in range(9)}},
+    5: {0xE8B9: "Image0", **{0xE8B0 + i: f"Image{i + 1}" for i in range(9)}},
+    6: {0xE820 + i: chr(ord("A") + i) for i in range(10)},
+    10: {0xE8A9: "Str0", **{0xE8A0 + i: f"Str{i + 1}" for i in range(9)}},
+    12: {0xE8BA: "Window"},
+    13: {0xE8BB: "RclWindw"},
+    14: {0xE8BC: "TblSet"},
+}
+
+
 # --- Minimal CBOR ---
 
 
@@ -909,20 +953,32 @@ def list_files():
 
 def directory_display_name(item):
     tok_name = item.get("tokName", b"")
-    if item.get("type") == 1 and isinstance(tok_name, bytes) and len(tok_name) == 2:
-        if tok_name[1] == 0xE8 and 0x30 <= tok_name[0] <= 0x35:
-            return f"L{tok_name[0] - 0x2F}"
-    if item.get("type") == 7 and isinstance(tok_name, bytes) and len(tok_name) == 2:
-        word = tok_name[0] | (tok_name[1] << 8)
-        if 0xE840 <= word <= 0xE849:
-            return f"Y{0 if word == 0xE849 else word - 0xE840 + 1}"
-        if 0xE850 <= word <= 0xE85B:
-            idx = (word - 0xE850) // 2 + 1
-            return f"{'X' if (word - 0xE850) % 2 == 0 else 'Y'}{idx}T"
-        if 0xE860 <= word <= 0xE865:
-            return f"r{word - 0xE860 + 1}"
-        if 0xE870 <= word <= 0xE872:
-            return chr(ord("u") + word - 0xE870)
+    type_id = item.get("type")
+    if isinstance(tok_name, bytes):
+        words = _token_words(tok_name)
+        if type_id in (2, 8, 9, 15):
+            custom = _decode_custom_name(tok_name)
+            if custom:
+                return custom
+        if type_id == 1 and words and words[0] == 0xE836:
+            custom = _decode_custom_name(tok_name[2:])
+            if custom:
+                return custom
+        if len(words) == 1:
+            table = COMMON_TOKEN_NAMES.get(type_id, {})
+            if words[0] in table:
+                return table[words[0]]
+            word = words[0]
+            if type_id == 7:
+                if 0xE840 <= word <= 0xE849:
+                    return f"Y{0 if word == 0xE849 else word - 0xE840 + 1}"
+                if 0xE850 <= word <= 0xE85B:
+                    idx = (word - 0xE850) // 2 + 1
+                    return f"{'X' if (word - 0xE850) % 2 == 0 else 'Y'}{idx}T"
+                if 0xE860 <= word <= 0xE865:
+                    return f"r{word - 0xE860 + 1}"
+                if 0xE870 <= word <= 0xE872:
+                    return chr(ord("u") + word - 0xE870)
 
     name = item.get("dispName", tok_name)
     if isinstance(name, bytes):
@@ -961,6 +1017,15 @@ def find_directory_entry(name, type_id=None):
         display = directory_display_name(item)
         requested = name.lower()
         candidates = {display.lower()}
+        tok_name = item.get("tokName", b"")
+        if isinstance(tok_name, bytes):
+            custom = _decode_custom_name(tok_name)
+            if custom:
+                candidates.add(custom.lower())
+            if item.get("type") == 1 and _token_words(tok_name)[:1] == [0xE836]:
+                custom = _decode_custom_name(tok_name[2:])
+                if custom:
+                    candidates.add(custom.lower())
         if item.get("type") == 6 and display.startswith("[") and display.endswith("]"):
             candidates.add(display[1:-1].lower())
         if item.get("type") == 14 and display.lower() == "tblsetup":
