@@ -10,6 +10,8 @@ Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --send-file <file> [auto|ram|archive]
        python3 evo_usb.py --get-file <name> [type] [output]
        python3 evo_usb.py --delete-file <name> [type]
+       python3 evo_usb.py --send-csv-list <csv> <name> [ram|archive] [overwrite|no-overwrite]
+       python3 evo_usb.py --send-csv-matrix <csv> <name> [ram|archive] [overwrite|no-overwrite]
        python3 evo_usb.py --send-os <os_bundle.83b2|84b2|84tb2>
        python3 evo_usb.py --extract-os <capture.pcapng> [output.bin]
        python3 evo_usb.py --get-info
@@ -22,6 +24,7 @@ Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --key <scancode>
 """
 
+import csv
 import glob
 import os
 import platform
@@ -709,7 +712,14 @@ COMMON_TOKEN_NAMES = {
 
 def cbor_text(s):
     b = s.encode()
-    return bytes([0x60 | len(b)]) + b
+    n = len(b)
+    if n < 24:
+        hdr = bytes([0x60 | n])
+    elif n < 256:
+        hdr = bytes([0x78, n])
+    else:
+        hdr = b"\x79" + struct.pack(">H", n)
+    return hdr + b
 
 
 def cbor_uint(n):
@@ -865,6 +875,21 @@ def build_payload(name, source):
     cbor += cbor_text("version") + cbor_uint(1)
     cbor += cbor_text("size") + cbor_uint(len(appvar))
     cbor += cbor_text("data") + cbor_bytes(appvar)
+    cbor += b"\xFF"
+    return bytes(cbor)
+
+
+def build_ascii_data_payload(kind, name, ascii_text):
+    data = ascii_text.encode("ascii")
+    cbor = bytearray(b"\xBF")
+    cbor += cbor_text("metaData") + b"\xBF"
+    cbor += cbor_text("type") + cbor_uint(60)
+    cbor += cbor_text("version") + cbor_uint(1)
+    cbor += b"\xFF"
+    cbor += cbor_text("type") + cbor_text(kind)
+    cbor += cbor_text("version") + cbor_uint(1)
+    cbor += cbor_text("name") + cbor_text(name)
+    cbor += cbor_text("data") + cbor_bytes(data)
     cbor += b"\xFF"
     return bytes(cbor)
 
@@ -1219,6 +1244,109 @@ def send_var_file(path, target="auto"):
         except Exception:
             pass
         _put_var_file_to_target(path, data, archive=True)
+
+
+def _parse_memory_target(target):
+    if isinstance(target, bool):
+        return target
+    target = target.lower()
+    if target == "ram":
+        return False
+    if target == "archive":
+        return True
+    raise ValueError("target must be ram or archive")
+
+
+def _parse_overwrite(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ("overwrite", "yes", "true", "1"):
+        return True
+    if value in ("no-overwrite", "no", "false", "0"):
+        return False
+    raise ValueError("overwrite must be overwrite or no-overwrite")
+
+
+def _ascii_number_text(text):
+    text = text.strip()
+    if text == "":
+        text = "0"
+    return text.replace("E", "@E").replace("e", "@E")
+
+
+def _read_csv_rows(path):
+    with open(path, newline="") as f:
+        return [row for row in csv.reader(f) if row]
+
+
+def csv_to_list_ascii(path):
+    values = []
+    for row in _read_csv_rows(path):
+        values.extend(_ascii_number_text(cell) for cell in row)
+    if not values:
+        raise ValueError("CSV list data is empty")
+    return "{" + ",".join(values) + "}"
+
+
+def csv_to_matrix_ascii(path):
+    rows = []
+    width = None
+    for row in _read_csv_rows(path):
+        values = [_ascii_number_text(cell) for cell in row]
+        if width is None:
+            width = len(values)
+        elif len(values) != width:
+            raise ValueError("CSV matrix rows must have the same number of columns")
+        rows.append("[" + ",".join(values) + "]")
+    if not rows:
+        raise ValueError("CSV matrix data is empty")
+    return "[" + "".join(rows) + "]"
+
+
+def normalize_ascii_list_name(name):
+    if name in ("L1", "L2", "L3", "L4", "L5", "L6"):
+        return name[1:]
+    name = name.replace("Θ", "θ")
+    first = name[:1]
+    valid_first = first in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzθ"
+    valid_rest = all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789θ" for c in name)
+    if (
+        len(name) <= 5
+        and first
+        and valid_first
+        and valid_rest
+    ):
+        return name.replace("θ", "theta")
+    raise ValueError("list name must be L1-L6 or a 1-5 character calculator list name")
+
+
+def normalize_ascii_matrix_name(name):
+    name = name.upper()
+    if name in ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J"):
+        return name
+    raise ValueError("matrix name must be A-J")
+
+
+def send_ascii_data(kind, name, ascii_text, target="ram", overwrite=True):
+    archive = _parse_memory_target(target)
+    overwrite = _parse_overwrite(overwrite)
+    payload = build_ascii_data_payload(kind, name, ascii_text)
+    memtarget = 1 if archive else 0
+    policy = 1 if overwrite else 0
+    _put_request(f"hh01/xfr/var?memtarget={memtarget}&policy={policy}", payload)
+    loc = "Archive" if archive else "RAM"
+    print(f"sent {kind.lower()} {name} to {loc} ({len(ascii_text)} ASCII bytes)")
+
+
+def send_csv_list(path, name, target="ram", overwrite=True):
+    normalized = normalize_ascii_list_name(name)
+    send_ascii_data("List", normalized, csv_to_list_ascii(path), target, overwrite)
+
+
+def send_csv_matrix(path, name, target="ram", overwrite=True):
+    normalized = normalize_ascii_matrix_name(name)
+    send_ascii_data("Matrix", normalized, csv_to_matrix_ascii(path), target, overwrite)
 
 
 def get_logs(output_dir="evo-logs"):
@@ -1796,6 +1924,24 @@ if __name__ == "__main__":
             sys.exit("usage: evo_usb.py --delete-file <name> [type]")
         type_id = int(sys.argv[3], 0) if len(sys.argv) > 3 else None
         delete_variable(sys.argv[2], type_id)
+    elif sys.argv[1] == "--send-csv-list":
+        if len(sys.argv) < 4:
+            sys.exit(
+                "usage: evo_usb.py --send-csv-list <csv> <name> "
+                "[ram|archive] [overwrite|no-overwrite]"
+            )
+        target = sys.argv[4] if len(sys.argv) > 4 else "ram"
+        overwrite = sys.argv[5] if len(sys.argv) > 5 else "overwrite"
+        send_csv_list(sys.argv[2], sys.argv[3], target, overwrite)
+    elif sys.argv[1] == "--send-csv-matrix":
+        if len(sys.argv) < 4:
+            sys.exit(
+                "usage: evo_usb.py --send-csv-matrix <csv> <name> "
+                "[ram|archive] [overwrite|no-overwrite]"
+            )
+        target = sys.argv[4] if len(sys.argv) > 4 else "ram"
+        overwrite = sys.argv[5] if len(sys.argv) > 5 else "overwrite"
+        send_csv_matrix(sys.argv[2], sys.argv[3], target, overwrite)
     elif sys.argv[1] == "--send-os":
         if len(sys.argv) < 3:
             sys.exit("usage: evo_usb.py --send-os <os_bundle.83b2|84b2|84tb2>")
