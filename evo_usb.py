@@ -121,24 +121,103 @@ def _checksum(data):
     return tochar((s + ((s >> 6) & 3)) & 0x3F)
 
 
-def make_packet(seq, pkt_type, data=b""):
+def _checksum2(data):
+    s = sum(data) & 0xFFFF
+    return bytes([tochar((s >> 6) & 0x3F), tochar(s & 0x3F)])
+
+
+def _crc16_kermit(data):
+    crc = 0
+    for b in data:
+        q = (crc ^ b) & 0x0F
+        crc = (crc >> 4) ^ (q * 0x1081)
+        q = (crc ^ (b >> 4)) & 0x0F
+        crc = (crc >> 4) ^ (q * 0x1081)
+    return crc & 0xFFFF
+
+
+def _checksum3(data):
+    crc = _crc16_kermit(data)
+    return bytes([
+        tochar((crc >> 12) & 0x0F),
+        tochar((crc >> 6) & 0x3F),
+        tochar(crc & 0x3F),
+    ])
+
+
+def _block_check(data, check_type=1):
+    if check_type == 1:
+        return bytes([_checksum(data)])
+    if check_type == 2:
+        return _checksum2(data)
+    if check_type == 3:
+        return _checksum3(data)
+    raise ValueError(f"unsupported Kermit check type {check_type}")
+
+
+class KermitSession:
+    def __init__(self):
+        self.check_type = 1
+        self.control_quote = QCTL
+        self.binary_quote = None
+        self.repeat_quote = REPT
+        self.max_packet_len = 2040
+
+    @property
+    def data_chunk_size(self):
+        return max(1, min(2000, self.max_packet_len - self.check_type - 8))
+
+    def update_from_send_init(self, data):
+        if len(data) > 5 and data[5] != 0x20:
+            self.control_quote = data[5]
+        if len(data) > 6 and data[6] not in (ord("N"), 0x20):
+            self.binary_quote = data[6]
+        if len(data) > 7 and chr(data[7]) in "123":
+            self.check_type = int(chr(data[7]))
+        if len(data) > 8 and data[8] != 0x20:
+            self.repeat_quote = data[8]
+        if len(data) > 12:
+            maxlx = unchar(data[11]) * 95 + unchar(data[12])
+            if maxlx >= 60:
+                self.max_packet_len = min(maxlx, 2040)
+
+
+def make_packet(seq, pkt_type, data=b"", session=None, check_type=None):
+    if check_type is None:
+        check_type = session.check_type if session is not None else 1
     s, t = tochar(seq % 64), ord(pkt_type) if isinstance(pkt_type, str) else pkt_type
-    n = len(data) + 3  # SEQ + TYPE + data + CHECK
+    n = len(data) + 2 + check_type  # SEQ + TYPE + data + CHECK
     if n <= 94:
         body = bytes([tochar(n), s, t]) + data
-        return bytes([SOH]) + body + bytes([_checksum(body), CR])
-    dlen = len(data) + 1
+        return bytes([SOH]) + body + _block_check(body, check_type) + bytes([CR])
+    dlen = len(data) + check_type
     hdr = bytes([tochar(0), s, t, tochar(dlen // 95), tochar(dlen % 95)])
-    body = hdr + bytes([_checksum(hdr)]) + data
-    return bytes([SOH]) + body + bytes([_checksum(body), CR])
+    body = hdr + _block_check(hdr, 1) + data
+    return bytes([SOH]) + body + _block_check(body, check_type) + bytes([CR])
 
 
-def parse_packet(raw):
+def parse_packet(raw, session=None, check_type=None):
+    if check_type is None:
+        check_type = session.check_type if session is not None else 1
     if len(raw) < 4 or raw[0] != SOH or raw[-1] != CR:
         raise ValueError(f"bad packet: {raw.hex()}")
     body = raw[1:-1]
     ext = body[0] == tochar(0)
-    return unchar(body[1]), chr(body[2]), body[6:-1] if ext else body[3:-1]
+    if len(body) < 3 + check_type:
+        raise ValueError(f"short packet: {raw.hex()}")
+    if ext:
+        if len(body) < 6 + check_type:
+            raise ValueError(f"short long packet: {raw.hex()}")
+        if body[5] != _checksum(body[:5]):
+            raise ValueError(f"bad long-packet header check: {raw.hex()}")
+        checked, check = body[:-check_type], body[-check_type:]
+        data = body[6:-check_type]
+    else:
+        checked, check = body[:-check_type], body[-check_type:]
+        data = body[3:-check_type]
+    if check != _block_check(checked, check_type):
+        raise ValueError(f"bad packet check: {raw.hex()}")
+    return unchar(body[1]), chr(body[2]), data
 
 
 def xfr_result_message(code):
@@ -474,12 +553,14 @@ def release(conn):
         pass
 
 
-def send_pkt(dev, seq, ptype, data=b"", timeout=TIMEOUT):
-    pkt = make_packet(seq, ptype, data)
+def send_pkt(dev, seq, ptype, data=b"", timeout=TIMEOUT, session=None):
+    pkt = make_packet(seq, ptype, data, session=session)
     for attempt in range(3):
         dev.write(pkt, timeout=timeout)
-        _, rtype, rdata = parse_packet(bytes(dev.read(timeout=timeout)))
+        _, rtype, rdata = parse_packet(bytes(dev.read(timeout=timeout)), session=session)
         if rtype == "Y":
+            if ptype == "S" and session is not None:
+                session.update_from_send_init(rdata)
             return rdata
         if rtype == "E":
             raise RuntimeError(f"calculator error on packet {ptype} seq {seq}: {transfer_error_text(rdata)}")
@@ -492,12 +573,12 @@ def send_pkt(dev, seq, ptype, data=b"", timeout=TIMEOUT):
     raise RuntimeError(f"packet {ptype} seq {seq} NAK'd after 3 retries")
 
 
-def recv_pkt(dev):
-    return parse_packet(bytes(dev.read(timeout=TIMEOUT)))
+def recv_pkt(dev, session=None, timeout=TIMEOUT):
+    return parse_packet(bytes(dev.read(timeout=timeout)), session=session)
 
 
-def ack(dev, seq, data=b""):
-    dev.write(make_packet(seq, "Y", data), timeout=TIMEOUT)
+def ack(dev, seq, data=b"", session=None, timeout=TIMEOUT):
+    dev.write(make_packet(seq, "Y", data, session=session), timeout=timeout)
 
 
 # --- Kermit file attributes ---
@@ -784,30 +865,31 @@ def build_payload(name, source):
 # --- Protocol flows ---
 
 
-def send_file(path, varname="memoryvi"):
+def send_file(path, varname="pyscript"):
     with open(path) as f:
         source = f.read()
 
     payload = build_payload(varname, source)
-    wire = encode(payload)
     url = f"hh01/xfr/var?name={url_encode_name(varname)}&type=15&memtarget=0&policy=1"
     attrs = file_attr('"', "B8") + file_attr("1", str(len(payload))) + file_attr("@")
 
     dev = connect()
     try:
+        session = KermitSession()
         seq = 0
-        send_pkt(dev, seq, "S", S_INIT)
+        send_pkt(dev, seq, "S", S_INIT, session=session)
         seq += 1
-        send_pkt(dev, seq, "F", url.encode())
+        send_pkt(dev, seq, "F", url.encode(), session=session)
         seq += 1
-        send_pkt(dev, seq, "A", attrs)
+        send_pkt(dev, seq, "A", attrs, session=session)
         seq += 1
-        for i in range(0, len(wire), 2000):
-            send_pkt(dev, seq, "D", wire[i : i + 2000])
+        wire = encode(payload)
+        for chunk in _split_element_aligned(wire, session.data_chunk_size):
+            send_pkt(dev, seq, "D", chunk, session=session)
             seq += 1
-        send_pkt(dev, seq, "Z")
+        send_pkt(dev, seq, "Z", session=session)
         seq += 1
-        send_pkt(dev, seq, "B")
+        send_pkt(dev, seq, "B", session=session)
         print(
             f"sent {path} -> '{varname}' ({len(source)}B source, {len(payload)}B payload)"
         )
@@ -857,41 +939,42 @@ def _get_request(url):
 
     dev = connect()
     try:
+        session = KermitSession()
         seq = 0
-        send_pkt(dev, seq, "S", S_INIT)
+        send_pkt(dev, seq, "S", S_INIT, session=session)
         seq += 1
-        send_pkt(dev, seq, "F", url.encode())
+        send_pkt(dev, seq, "F", url.encode(), session=session)
         seq += 1
-        send_pkt(dev, seq, "A", attrs)
+        send_pkt(dev, seq, "A", attrs, session=session)
         seq += 1
-        send_pkt(dev, seq, "D", b"\x68")
+        send_pkt(dev, seq, "D", b"\x68", session=session)
         seq += 1
-        send_pkt(dev, seq, "Z")
+        send_pkt(dev, seq, "Z", session=session)
         seq += 1
-        send_pkt(dev, seq, "B")
+        send_pkt(dev, seq, "B", session=session)
 
-        rseq, rtype, rdata = recv_pkt(dev)
+        rseq, rtype, rdata = recv_pkt(dev, session=session)
         if rtype != "S":
             raise RuntimeError(f"expected S, got {rtype}")
-        ack(dev, rseq, rdata)
+        ack(dev, rseq, rdata, session=session)
 
         for expected in ("F", "A"):
-            rseq, rtype, rdata = recv_pkt(dev)
+            rseq, rtype, rdata = recv_pkt(dev, session=session)
             if rtype != expected:
                 raise RuntimeError(f"expected {expected}, got {rtype}")
-            ack(dev, rseq)
+            ack(dev, rseq, session=session)
 
         chunks = []
         while True:
-            rseq, rtype, rdata = recv_pkt(dev)
-            ack(dev, rseq)
+            rseq, rtype, rdata = recv_pkt(dev, session=session)
+            ack(dev, rseq, session=session)
             if rtype == "Z":
                 break
             chunks.append(rdata)
 
-        rseq, rtype, rdata = recv_pkt(dev)
+        rseq, rtype, rdata = recv_pkt(dev, session=session)
         if rtype == "B":
-            ack(dev, rseq)
+            ack(dev, rseq, session=session)
 
         return decode(b"".join(chunks))
     finally:
@@ -900,24 +983,25 @@ def _get_request(url):
 
 def _put_request(url, payload, timeout=TIMEOUT, chunk_size=2000):
     wire = encode(payload)
-    wire_chunks = _split_element_aligned(wire, chunk_size)
     attrs = file_attr('"', "B8") + file_attr("1", str(len(payload))) + file_attr("@")
 
     dev = connect()
     try:
+        session = KermitSession()
         seq = 0
-        send_pkt(dev, seq, "S", S_INIT, timeout=timeout)
+        send_pkt(dev, seq, "S", S_INIT, timeout=timeout, session=session)
         seq += 1
-        send_pkt(dev, seq, "F", url.encode(), timeout=timeout)
+        send_pkt(dev, seq, "F", url.encode(), timeout=timeout, session=session)
         seq += 1
-        send_pkt(dev, seq, "A", attrs, timeout=timeout)
+        send_pkt(dev, seq, "A", attrs, timeout=timeout, session=session)
         seq += 1
+        wire_chunks = _split_element_aligned(wire, min(chunk_size, session.data_chunk_size))
         for chunk in wire_chunks:
-            send_pkt(dev, seq, "D", chunk, timeout=timeout)
+            send_pkt(dev, seq, "D", chunk, timeout=timeout, session=session)
             seq += 1
-        send_pkt(dev, seq, "Z", timeout=timeout)
+        send_pkt(dev, seq, "Z", timeout=timeout, session=session)
         seq += 1
-        send_pkt(dev, seq, "B", timeout=timeout)
+        send_pkt(dev, seq, "B", timeout=timeout, session=session)
     finally:
         release(dev)
 
@@ -1520,23 +1604,24 @@ def send_os(path):
     print("  encoding...", end="", flush=True)
     wire = encode(data)
 
-    wire_chunks = _split_element_aligned(wire)
-    total_encoded = sum(len(c) for c in wire_chunks)
-    print(f" {total_encoded} bytes, {len(wire_chunks)} chunks")
-
     os_timeout = 30000
     url = f"hh01/upd/pkg?bundle=1&prodnum={prodnum}&version={version}"
     attrs = file_attr('"', "B8") + file_attr("1", str(len(data))) + file_attr("@")
 
     dev = connect()
     try:
+        session = KermitSession()
         seq = 0
-        send_pkt(dev, seq, "S", S_INIT, timeout=os_timeout)
+        send_pkt(dev, seq, "S", S_INIT, timeout=os_timeout, session=session)
         seq += 1
-        send_pkt(dev, seq, "F", url.encode(), timeout=os_timeout)
+        send_pkt(dev, seq, "F", url.encode(), timeout=os_timeout, session=session)
         seq += 1
-        send_pkt(dev, seq, "A", attrs, timeout=os_timeout)
+        send_pkt(dev, seq, "A", attrs, timeout=os_timeout, session=session)
         seq += 1
+
+        wire_chunks = _split_element_aligned(wire, session.data_chunk_size)
+        total_encoded = sum(len(c) for c in wire_chunks)
+        print(f" {total_encoded} bytes, {len(wire_chunks)} chunks")
 
         total_chunks = len(wire_chunks)
         for chunk_num, chunk in enumerate(wire_chunks, 1):
@@ -1547,14 +1632,14 @@ def send_os(path):
                     end="",
                     flush=True,
                 )
-            send_pkt(dev, seq, "D", chunk, timeout=os_timeout)
+            send_pkt(dev, seq, "D", chunk, timeout=os_timeout, session=session)
             seq += 1
 
         print()
-        send_pkt(dev, seq, "Z", timeout=os_timeout)
+        send_pkt(dev, seq, "Z", timeout=os_timeout, session=session)
         seq += 1
         try:
-            send_pkt(dev, seq, "B", timeout=os_timeout)
+            send_pkt(dev, seq, "B", timeout=os_timeout, session=session)
         except TRANSFER_ERROR_EXCEPTIONS:
             pass
         print(f"sent OS bundle ({len(data)} bytes, {total_chunks} packets)")
@@ -1592,6 +1677,7 @@ def _sys_command(url):
 
     dev = connect()
     try:
+        session = KermitSession()
         seq = 0
         for ptype, data in [
             ("S", S_INIT),
@@ -1601,14 +1687,16 @@ def _sys_command(url):
             ("Z", b""),
             ("B", b""),
         ]:
-            pkt = make_packet(seq, ptype, data)
+            pkt = make_packet(seq, ptype, data, session=session)
             dev.write(pkt, timeout=TIMEOUT)
             try:
                 _, rtype, rdata = parse_packet(
-                    bytes(dev.read(timeout=TIMEOUT))
+                    bytes(dev.read(timeout=TIMEOUT)), session=session
                 )
                 if rtype == "E":
                     sys.exit(f"error response at {ptype} packet: {transfer_error_text(rdata)}")
+                if ptype == "S" and rtype == "Y":
+                    session.update_from_send_init(rdata)
             except TRANSPORT_TIMEOUT_EXCEPTIONS + TRANSPORT_ERROR_EXCEPTIONS:
                 break
             seq += 1
@@ -1641,6 +1729,7 @@ def send_scancode(sc):
 
     dev = connect()
     try:
+        session = KermitSession()
         seq = 0
         for ptype, data in [
             ("S", S_INIT),
@@ -1650,11 +1739,13 @@ def send_scancode(sc):
             ("Z", b""),
             ("B", b""),
         ]:
-            pkt = make_packet(seq, ptype, data)
+            pkt = make_packet(seq, ptype, data, session=session)
             dev.write(pkt, timeout=TIMEOUT)
-            _, rtype, rdata = parse_packet(bytes(dev.read(timeout=TIMEOUT)))
+            _, rtype, rdata = parse_packet(bytes(dev.read(timeout=TIMEOUT)), session=session)
             if rtype == "E":
                 raise RuntimeError(f"scancode {sc}: error at {ptype} packet: {transfer_error_text(rdata)}")
+            if ptype == "S" and rtype == "Y":
+                session.update_from_send_init(rdata)
             seq += 1
     finally:
         try:
