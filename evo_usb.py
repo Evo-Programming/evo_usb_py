@@ -635,12 +635,13 @@ def save_rgb565_png(path, rgb565, width=320, height=240):
 
 # --- TI variable name encoding ---
 
+EVO_CUSTOM_NAME_THETA = 0xE81A
+
 
 def url_encode_name(name):
     out = []
-    for c in name.lower():
-        cp = 0xE800 + ord(c) - ord("a")
-        out.append(f"%{0xE0|cp>>12&0xF:02X}%{0x80|cp>>6&0x3F:02X}%{0x80|cp&0x3F:02X}")
+    for word in evo_python_transfer_name_words(name):
+        out.extend(f"%{b:02X}" for b in chr(word).encode("utf-8"))
     return "".join(out)
 
 
@@ -658,9 +659,30 @@ def url_encode_name_bytes(name_bytes):
 
 def token_encode_name(name):
     out = bytearray()
-    for c in name.lower():
-        out += bytes([ord(c) - ord("a"), 0xE8])
+    for word in evo_python_transfer_name_words(name):
+        out += struct.pack("<H", word)
     return bytes(out)
+
+
+def evo_python_transfer_name_words(name):
+    words = []
+    for c in name.upper():
+        if "A" <= c <= "Z":
+            words.append(0xE800 + ord(c) - ord("A"))
+        elif c == "Θ":
+            words.append(EVO_CUSTOM_NAME_THETA)
+        elif "0" <= c <= "9":
+            words.append(0xE401 + ord(c) - ord("0"))
+        else:
+            raise ValueError(f"unsupported Evo Python name character: {c!r}")
+    return words
+
+
+def is_valid_evo_python_name(name):
+    return 1 <= len(name) <= 8 and all(
+        ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "θΘ"
+        for c in name
+    )
 
 
 def _token_words(name_bytes):
@@ -686,8 +708,12 @@ def _decode_custom_name(name_bytes):
             chars.append(chr(word))
         elif 0x0030 <= word <= 0x0039:
             chars.append(chr(word))
+        elif 0xE401 <= word <= 0xE40A:
+            chars.append(chr(ord("0") + word - 0xE401))
         elif word == 0x005F:
             chars.append("_")
+        elif word == EVO_CUSTOM_NAME_THETA:
+            chars.append("θ")
         else:
             return None
     return "".join(chars) if chars else None
