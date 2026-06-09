@@ -21,7 +21,8 @@ Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --dynamic-info
        python3 evo_usb.py --get-logs [output_dir]
        python3 evo_usb.py --exit-ptt
-       python3 evo_usb.py --key <scancode>
+       python3 evo_usb.py --key <scancode> [scancode ...]
+       python3 evo_usb.py --keys <scancode>[,<scancode>...]
 """
 
 import csv
@@ -1888,39 +1889,82 @@ def send_break():
     print("break sent")
 
 
-def send_scancode(sc):
+def scancode_payload(sc):
+    if sc < 0 or sc > 0xFF:
+        raise ValueError("scancode must fit in one byte")
     if sc < 24:
-        payload = bytes([0x9F, sc, 0xFF])
-    else:
-        payload = bytes([0x9F, 0x18, sc, 0xFF])
+        return bytes([0x9F, sc, 0xFF])
+    return bytes([0x9F, 0x18, sc, 0xFF])
+
+
+def send_scancode_packet(dev, session, seq, sc):
+    payload = scancode_payload(sc)
     wire = encode(payload)
     attrs = file_attr('"', "B8") + file_attr("1", str(len(payload))) + file_attr("@")
+
+    for ptype, data in [
+        ("F", b"hh01/sys/scancode"),
+        ("A", attrs),
+        ("D", wire),
+        ("Z", b""),
+    ]:
+        pkt = make_packet(seq, ptype, data, session=session)
+        dev.write(pkt, timeout=TIMEOUT)
+        _, rtype, rdata = parse_packet(bytes(dev.read(timeout=TIMEOUT)), session=session)
+        if rtype == "E":
+            raise RuntimeError(f"scancode {sc}: error at {ptype} packet: {transfer_error_text(rdata)}")
+        seq += 1
+    return seq
+
+
+def send_scancodes(scancodes, delay=0.08):
+    scancodes = list(scancodes)
+    if not scancodes:
+        raise ValueError("need at least one scancode")
 
     dev = connect()
     try:
         session = KermitSession()
         seq = 0
-        for ptype, data in [
-            ("S", S_INIT),
-            ("F", b"hh01/sys/scancode"),
-            ("A", attrs),
-            ("D", wire),
-            ("Z", b""),
-            ("B", b""),
-        ]:
-            pkt = make_packet(seq, ptype, data, session=session)
-            dev.write(pkt, timeout=TIMEOUT)
-            _, rtype, rdata = parse_packet(bytes(dev.read(timeout=TIMEOUT)), session=session)
-            if rtype == "E":
-                raise RuntimeError(f"scancode {sc}: error at {ptype} packet: {transfer_error_text(rdata)}")
-            if ptype == "S" and rtype == "Y":
-                session.update_from_send_init(rdata)
-            seq += 1
+
+        pkt = make_packet(seq, "S", S_INIT, session=session)
+        dev.write(pkt, timeout=TIMEOUT)
+        _, rtype, rdata = parse_packet(bytes(dev.read(timeout=TIMEOUT)), session=session)
+        if rtype == "E":
+            raise RuntimeError(f"scancode sequence: error at S packet: {transfer_error_text(rdata)}")
+        if rtype == "Y":
+            session.update_from_send_init(rdata)
+        seq += 1
+
+        for sc in scancodes:
+            seq = send_scancode_packet(dev, session, seq, sc)
+            if delay:
+                time.sleep(delay)
+
+        pkt = make_packet(seq, "B", b"", session=session)
+        dev.write(pkt, timeout=TIMEOUT)
+        _, rtype, rdata = parse_packet(bytes(dev.read(timeout=TIMEOUT)), session=session)
+        if rtype == "E":
+            raise RuntimeError(f"scancode sequence: error at B packet: {transfer_error_text(rdata)}")
     finally:
         try:
             release(dev)
         except Exception:
             pass
+
+
+def send_scancode(sc):
+    send_scancodes([sc])
+
+
+def parse_scancode_args(args):
+    scancodes = []
+    for arg in args:
+        for part in arg.split(","):
+            part = part.strip()
+            if part:
+                scancodes.append(int(part, 0))
+    return scancodes
 
 
 if __name__ == "__main__":
@@ -1999,12 +2043,12 @@ if __name__ == "__main__":
         get_logs(sys.argv[2] if len(sys.argv) > 2 else "evo-logs")
     elif sys.argv[1] == "--exit-ptt":
         exit_ptt()
-    elif sys.argv[1] == "--key":
+    elif sys.argv[1] in ("--key", "--keys"):
         if len(sys.argv) < 3:
-            sys.exit("usage: evo_usb.py --key <scancode>")
-        send_scancode(int(sys.argv[2], 0))
+            sys.exit("usage: evo_usb.py --key <scancode> [scancode ...]")
+        send_scancodes(parse_scancode_args(sys.argv[2:]))
     else:
         name = sys.argv[2] if len(sys.argv) > 2 else "pyscript"
-        if len(name) > 8 or not all("a" <= c <= "z" for c in name):
-            sys.exit("varname: 1-8 lowercase letters")
+        if not is_valid_evo_python_name(name):
+            sys.exit("varname: 1-8 letters/digits/theta")
         send_file(sys.argv[1], name)
