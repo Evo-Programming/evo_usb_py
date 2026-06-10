@@ -30,7 +30,8 @@ Usage: python3 evo_usb.py ...
   --break
   --get-logs [output_dir]
   --exit-ptt
-  --key <scancode>
+  --key <scancode> [scancode ...]
+  --keys <scancode>[,<scancode>...]
 ```
 
 CSV imports default to RAM and overwrite existing variables. List names may be `L1`-`L6` or a 1-5 character calculator list name; matrix names may be `A`-`J`.
