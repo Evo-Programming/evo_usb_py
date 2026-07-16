@@ -11,6 +11,8 @@ You may have to adjust your permissions for serial access:
 
 If auto-detection does not pick the right serial device, set `EVO_USB_SERIAL` to the path or port name, for example `/dev/cu.usbmodemRTX_DUMMY1` or `/dev/ttyACM0` or `COM3`.
 
+To connect to a remotely-exposed USB link over TCP, set `EVO_USB_SERIAL` to `tcp:<port>` for localhost or `tcp:<host>:<port>`, for example `tcp:8000` or `tcp:192.0.2.10:8000`.
+
 ```bash
 Usage: python3 evo_usb.py ...
 

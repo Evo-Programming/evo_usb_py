@@ -30,6 +30,7 @@ import glob
 import os
 import platform
 import select
+import socket
 import struct
 import sys
 import time
@@ -421,6 +422,51 @@ class PySerialConnection:
             raise TransportError(f"{self.path}: {e}") from e
 
 
+class TcpConnection:
+    def __init__(self, endpoint):
+        payload = endpoint[4:]
+        if ":" in payload:
+            host, port = payload.rsplit(":", 1)
+        else:
+            host, port = "127.0.0.1", payload
+        self.path = f"tcp:{host}:{port}"
+        self.sock = socket.create_connection(
+            (host or "127.0.0.1", int(port)), TIMEOUT / 1000
+        )
+        self._rx = bytearray()
+
+    def write(self, data, timeout=None):
+        self.sock.settimeout((timeout if timeout is not None else TIMEOUT) / 1000)
+        try:
+            self.sock.sendall(data)
+        except socket.timeout as e:
+            raise TransportTimeout(f"socket write timed out on {self.path}") from e
+        except OSError as e:
+            raise TransportError(f"{self.path}: {e}") from e
+        return len(data)
+
+    def read(self, timeout=None):
+        self.sock.settimeout((timeout if timeout is not None else TIMEOUT) / 1000)
+        while True:
+            if CR in self._rx:
+                idx = self._rx.index(CR) + 1
+                pkt = bytes(self._rx[:idx])
+                del self._rx[:idx]
+                return pkt
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout as e:
+                raise TransportTimeout(f"socket read timed out on {self.path}") from e
+            except OSError as e:
+                raise TransportError(f"{self.path}: {e}") from e
+            if not chunk:
+                raise TransportError(f"socket closed on {self.path}")
+            self._rx.extend(chunk)
+
+    def close(self):
+        self.sock.close()
+
+
 def _deadline(timeout):
     return time.monotonic() + ((timeout if timeout is not None else TIMEOUT) / 1000)
 
@@ -514,6 +560,10 @@ def _connect_pyserial():
 
 
 def _connect_serial():
+    configured = os.environ.get("EVO_USB_SERIAL", "")
+    if configured.startswith("tcp:"):
+        return TcpConnection(configured)
+
     if platform.system() == "Windows":
         return _connect_pyserial()
 
