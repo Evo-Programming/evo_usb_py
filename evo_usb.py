@@ -233,18 +233,48 @@ def parse_packet(raw, session=None, check_type=None):
 
 
 def xfr_result_message(code):
-    return XFR_RESULT_MESSAGES.get(code, f"Error: {code}")
+    status = "Error" if code != 0 else "OK"
+    hint = ". Check naming/memory-location restrictions?" if code != 0 else ""
+    message = XFR_RESULT_MESSAGES.get(code, f"{status}: {code}")
+    return f"{message}{hint}"
 
 
-RAW_TRANSFER_ERROR_HINTS = {
-    "PM": "maybe rejected data or invalid memory destination",
-    "DP": "maybe rejected data or invalid memory destination",
-    "ER": "unknown calculator error, maybe rejected data",
+# Kermit E packets carry a two-letter representation of the same transfer
+# result enum used by binary responses.
+XFR_RESULT_CODES_BY_WIRE = {
+    "OK": 0,
+    "ER": 1,
+    "PM": 2,
+    "NP": 3,
+    "NM": 4,
+    "FL": 5,
+    "IN": 6,
+    "NC": 7,
+    "NF": 8,
+    "CN": 9,
+    "TO": 10,
+    "DI": 11,
+    "UN": 12,
+    "NV": 13,
+    "VE": 14,
+    "DP": 15,
+    "BZ": 16,
+    "LB": 17,
+    "WT": 18,
+    "OW": 19,
+    "OA": 20,
+    "OM": 21,
+    "QU": 22,
+    "NR": 23,
+    "DR": 24,
 }
 
 
-def raw_transfer_error_hint(text):
-    return RAW_TRANSFER_ERROR_HINTS.get(text, "unknown calculator error")
+def xfr_wire_result_message(text):
+    code = XFR_RESULT_CODES_BY_WIRE.get(text)
+    if code is None:
+        return "unknown transfer result code"
+    return xfr_result_message(code)
 
 
 def is_raw_transfer_error(text, codes):
@@ -262,7 +292,7 @@ def transfer_error_text(data):
             message = xfr_result_message(code)
             return f"{text} ({message})" if message not in text else text
         if len(text) == 2 and text.isalpha():
-            return f"{text} ({raw_transfer_error_hint(text)})"
+            return f"{text} ({xfr_wire_result_message(text)})"
         return text
 
     if len(data) == 1:
@@ -1312,8 +1342,8 @@ def send_var_file(path, target="auto"):
     try:
         _put_var_file_to_target(path, data, archive=False)
     except RuntimeError as e:
-        # Some AppVar-like samples reject the RAM target with raw calculator
-        # payloads like DP, but accept the same file through Archive.
+        # The firmware reports PARAM (PM) or INVALID_DATA_PAYLOAD (DP) for
+        # some RAM target/payload combinations that it accepts in Archive.
         if not is_raw_transfer_error(str(e), ("PM", "DP")):
             raise
         try:
