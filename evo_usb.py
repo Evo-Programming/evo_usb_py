@@ -21,8 +21,9 @@ Usage: python3 evo_usb.py <script.py> [varname]
        python3 evo_usb.py --dynamic-info
        python3 evo_usb.py --get-logs [output_dir]
        python3 evo_usb.py --exit-ptt
-       python3 evo_usb.py --key <scancode> [scancode ...]
-       python3 evo_usb.py --keys <scancode>[,<scancode>...]
+       python3 evo_usb.py --key <key|scancode> [key|scancode ...]
+       python3 evo_usb.py --keys <key|scancode>[,<key|scancode>...]
+       python3 evo_usb.py --list-keys
 """
 
 import csv
@@ -1969,6 +1970,22 @@ def send_break():
     print("break sent")
 
 
+# Key names for --key/--keys in keypad order.
+KEY_NAMES = {
+    "yequ": 0x35, "window": 0x34, "zoom": 0x33, "trace": 0x32, "graph": 0x31,
+    "2nd": 0x36, "mode": 0x37, "del": 0x38,
+    "up": 0x04, "left": 0x02, "right": 0x03, "down": 0x01,
+    "alpha": 0x30, "xvar": 0x28, "stat": 0x20,
+    "math": 0x2F, "frac": 0x27, "prgm": 0x1F, "vars": 0x17, "clear": 0x0F,
+    "power": 0x2E, "sin": 0x26, "cos": 0x1E, "tan": 0x16, "divide": 0x0E,
+    "square": 0x2D, "comma": 0x25, "lparen": 0x1D, "rparen": 0x15, "times": 0x0D,
+    "log": 0x2C, "d7": 0x24, "d8": 0x1C, "d9": 0x14, "minus": 0x0C,
+    "ln": 0x2B, "d4": 0x23, "d5": 0x1B, "d6": 0x13, "plus": 0x0B,
+    "sto": 0x2A, "d1": 0x22, "d2": 0x1A, "d3": 0x12, "approx": 0x0A,
+    "d0": 0x21, "dot": 0x19, "negate": 0x11, "enter": 0x09,
+}
+
+
 def scancode_payload(sc):
     if sc < 0 or sc > 0xFF:
         raise ValueError("scancode must fit in one byte")
@@ -2042,7 +2059,9 @@ def parse_scancode_args(args):
     for arg in args:
         for part in arg.split(","):
             part = part.strip()
-            if part:
+            if part.lower() in KEY_NAMES:
+                scancodes.append(KEY_NAMES[part.lower()])
+            elif part:
                 scancodes.append(int(part, 0))
     return scancodes
 
@@ -2125,8 +2144,11 @@ if __name__ == "__main__":
         exit_ptt()
     elif sys.argv[1] in ("--key", "--keys"):
         if len(sys.argv) < 3:
-            sys.exit("usage: evo_usb.py --key <scancode> [scancode ...]")
+            sys.exit("usage: evo_usb.py --key <key|scancode> [key|scancode ...]")
         send_scancodes(parse_scancode_args(sys.argv[2:]))
+    elif sys.argv[1] == "--list-keys":
+        for name, sc in KEY_NAMES.items():
+            print(f"  {name:8s} 0x{sc:02X}")
     else:
         name = sys.argv[2] if len(sys.argv) > 2 else "pyscript"
         if not is_valid_evo_python_name(name):
