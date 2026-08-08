@@ -32,8 +32,11 @@ Usage: python3 evo_usb.py ...
   --break
   --get-logs [output_dir]
   --exit-ptt
-  --key <scancode> [scancode ...]
-  --keys <scancode>[,<scancode>...]
+  --key <key|scancode> [key|scancode ...]
+  --keys <key|scancode>[,<key|scancode>...]
+  --list-keys
 ```
 
 CSV imports default to RAM and overwrite existing variables. List names may be `L1`-`L6` or a 1-5 character calculator list name; matrix names may be `A`-`J`.
+
+`--key` accepts key names as well as raw scancodes; `--list-keys` prints the map in keypad order. Digit keys are `d0`-`d9` since bare numbers are read as raw scancodes.
