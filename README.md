@@ -37,3 +37,40 @@ Usage: python3 evo_usb.py ...
 ```
 
 CSV imports default to RAM and overwrite existing variables. List names may be `L1`-`L6` or a 1-5 character calculator list name; matrix names may be `A`-`J`.
+
+Python bytecode modules are supported in both the OS 7.0 `.8xpy2` (type 15)
+and OS 7.1+ `.8mp2` (type 18) containers. `--send-file` always sends bytecode
+to Archive, including when `ram` was requested. It queries the connected OS
+and, if needed, repackages in memory before sending: 7.0.x selects type 15;
+7.1 or later, including future major versions, selects type 18. When the version
+is unavailable/unrecognized, the original wrapper is tried first. A calculator
+`DP` (invalid data payload) response triggers at most one repackaging/retry in
+the other format, also if a version-selected transfer fails. Files on disk are not changed.
+Unknown metadata and malformed objects are not automatically converted;
+other transfer errors and a failed second attempt are reported normally.
+
+The known 7.1 wrapper changes type 15 to 18, adds `flags=1`, and terminates the
+tokenized name with `00 00`. Outer CBOR lengths and checksum are updated.
+Conversion back to 7.0 reverses those metadata changes. The entire CBOR `data`
+byte string stays byte-identical, including MPY v5 code, optional menus, and
+any bytes beyond the Python object's declared length. `A5` is not a required
+trailer, and no alignment padding is added or removed. The OS 7.1 importer
+accepts the supplied byte-string length; exports copy the stored bytes.
+
+Verified on OS 7.1.0.4421: freshly packed, unpadded modules covering all four
+object-size residues modulo four, legacy-wrapper conversion with menus, and
+arbitrary one- and five-byte tails all transferred and read back byte-exactly.
+An explicit RAM request still sent these modules to Archive. This validates
+transfer/storage, not calculator-side Python execution or a fresh OS 7.0 run.
+
+Ordinary type-15 Python **source programs** retain their existing RAM/Archive
+behavior and are never converted to bytecode containers.
+
+```bash
+python3 evo_usb.py --send-file TI_DRAW.8mp2
+python3 evo_usb.py --get-file TI_DRAW 18
+```
+
+The second command saves `TI_DRAW.8mp2` when the module appears in the
+calculator's directory. Transfers use the name embedded in the file and
+overwrite existing variables.

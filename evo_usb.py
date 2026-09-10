@@ -791,7 +791,7 @@ def _decode_custom_name(name_bytes):
             chars.append(chr(word))
         elif 0xE401 <= word <= 0xE40A:
             chars.append(chr(ord("0") + word - 0xE401))
-        elif word == 0x005F:
+        elif word in (0x005F, 0xE400):
             chars.append("_")
         elif word == EVO_CUSTOM_NAME_THETA:
             chars.append("θ")
@@ -834,7 +834,9 @@ def cbor_uint(n):
         return bytes([n])
     if n < 256:
         return bytes([0x18, n])
-    return b"\x19" + struct.pack(">H", n)
+    if n < 65536:
+        return b"\x19" + struct.pack(">H", n)
+    return b"\x1a" + struct.pack(">I", n)
 
 
 def cbor_bytes(data):
@@ -843,8 +845,10 @@ def cbor_bytes(data):
         hdr = bytes([0x40 | n])
     elif n < 256:
         hdr = bytes([0x58, n])
-    else:
+    elif n < 65536:
         hdr = b"\x59" + struct.pack(">H", n)
+    else:
+        hdr = b"\x5a" + struct.pack(">I", n)
     return hdr + data
 
 
@@ -864,7 +868,7 @@ def _cbor_read_len(data, offset, addl):
     raise ValueError(f"unsupported CBOR additional info {addl}")
 
 
-def _cbor_decode(data, offset=0):
+def _cbor_decode(data, offset=0, reject_duplicate_keys=False):
     if offset >= len(data):
         raise ValueError("unexpected end of CBOR data")
     initial = data[offset]
@@ -881,7 +885,7 @@ def _cbor_decode(data, offset=0):
         chunks = []
         if length is None:
             while offset < len(data) and data[offset] != 0xFF:
-                chunk, offset = _cbor_decode(data, offset)
+                chunk, offset = _cbor_decode(data, offset, reject_duplicate_keys)
                 chunks.append(chunk)
             offset += 1
             value = b"".join(chunks) if major == 2 else "".join(chunks)
@@ -896,11 +900,11 @@ def _cbor_decode(data, offset=0):
         out = []
         if length is None:
             while offset < len(data) and data[offset] != 0xFF:
-                value, offset = _cbor_decode(data, offset)
+                value, offset = _cbor_decode(data, offset, reject_duplicate_keys)
                 out.append(value)
             return out, offset + 1
         for _ in range(length):
-            value, offset = _cbor_decode(data, offset)
+            value, offset = _cbor_decode(data, offset, reject_duplicate_keys)
             out.append(value)
         return out, offset
     if major == 5:
@@ -908,13 +912,17 @@ def _cbor_decode(data, offset=0):
         out = {}
         if length is None:
             while offset < len(data) and data[offset] != 0xFF:
-                key, offset = _cbor_decode(data, offset)
-                value, offset = _cbor_decode(data, offset)
+                key, offset = _cbor_decode(data, offset, reject_duplicate_keys)
+                value, offset = _cbor_decode(data, offset, reject_duplicate_keys)
+                if reject_duplicate_keys and key in out:
+                    raise ValueError("duplicate CBOR map key")
                 out[key] = value
             return out, offset + 1
         for _ in range(length):
-            key, offset = _cbor_decode(data, offset)
-            value, offset = _cbor_decode(data, offset)
+            key, offset = _cbor_decode(data, offset, reject_duplicate_keys)
+            value, offset = _cbor_decode(data, offset, reject_duplicate_keys)
+            if reject_duplicate_keys and key in out:
+                raise ValueError("duplicate CBOR map key")
             out[key] = value
         return out, offset
     if major == 7:
@@ -929,8 +937,8 @@ def _cbor_decode(data, offset=0):
     raise ValueError(f"unsupported CBOR item 0x{initial:02x}")
 
 
-def cbor_loads(data):
-    value, offset = _cbor_decode(data)
+def cbor_loads(data, reject_duplicate_keys=False):
+    value, offset = _cbor_decode(data, reject_duplicate_keys=reject_duplicate_keys)
     if offset != len(data):
         raise ValueError("trailing CBOR data")
     return value
@@ -1187,7 +1195,7 @@ def directory_display_name(item):
     type_id = item.get("type")
     if isinstance(tok_name, bytes):
         words = _token_words(tok_name)
-        if type_id in (2, 8, 9, 15):
+        if type_id in (2, 8, 9, 15, 18):
             custom = _decode_custom_name(tok_name)
             if custom:
                 return custom
@@ -1232,6 +1240,7 @@ EVO_TYPE_EXTENSIONS = {
     13: "8xz2",
     14: "8xt2",
     15: "8xpy2",
+    18: "8mp2",
 }
 
 
@@ -1310,6 +1319,94 @@ def evo_file_type(data):
         return None
 
 
+def evo_python_module(data):
+    """Recognize a checksummed Evo MPY object, not a type-15 source program."""
+    try:
+        if evo_checksum(data[:-2]) != int.from_bytes(data[-2:], "big"):
+            return None
+        obj = cbor_loads(data[:-2], reject_duplicate_keys=True)
+        if obj["metaData"]["type"] not in (15, 18):
+            return None
+        payload = obj["data"]
+        if obj["size"] != len(payload) or payload[:4] != b"\x13\x02\xd8\x20":
+            return None
+        end = int.from_bytes(payload[4:8], "little")
+        if not 8 < end <= len(payload):
+            return None
+        offset, kinds = 8, []
+        while offset < end:
+            if end - offset < 5:
+                return None
+            size = int.from_bytes(payload[offset:offset + 3], "little")
+            kind = payload[offset + 3]
+            stop = offset + 4 + size
+            if stop >= end or payload[stop] != 0:
+                return None
+            if kind == 2 and (size < 4 or payload[offset + 4:offset + 6] != b"M\x05"):
+                return None
+            kinds.append(kind)
+            offset = stop + 1
+        return obj if kinds in ([0, 2], [0, 1, 2]) else None
+    except (ValueError, TypeError, KeyError, IndexError, RecursionError, struct.error):
+        return None
+
+
+def repackage_python_module(data):
+    """Toggle the known 7.0/7.1 wrapper; preserve the entire data byte string.
+
+    Return None for unfamiliar metadata rather than discard it. Bytes after
+    the declared Python object are stored data, not a required trailer.
+    """
+    obj = evo_python_module(data)
+    if obj is None:
+        return None
+    meta = obj["metaData"]
+    if (set(obj) != {"metaData", "version", "size", "data"}
+            or set(meta) - {"type", "version", "flags", "name"}
+            or obj["version"] != 1 or meta.get("version") != 1):
+        return None
+    name = meta.get("name")
+    if not isinstance(name, bytes) or not name or len(name) % 2:
+        return None
+    if name.endswith(b"\0\0"):
+        name = name[:-2]
+    if not name or any(name[i:i + 2] == b"\0\0" for i in range(0, len(name), 2)):
+        return None
+    payload = obj["data"]
+    if meta["type"] == 15:
+        if "flags" in meta:
+            return None
+        type_id, name = 18, name + b"\0\0"
+    else:
+        if meta.get("flags") != 1:
+            return None
+        type_id = 15
+    body = b"\xbf" + cbor_text("metaData") + b"\xbf"
+    body += cbor_text("type") + cbor_uint(type_id)
+    body += cbor_text("version") + cbor_uint(1)
+    if type_id == 18:
+        body += cbor_text("flags") + cbor_uint(1)
+    body += cbor_text("name") + cbor_bytes(name) + b"\xff"
+    body += cbor_text("version") + cbor_uint(1)
+    body += cbor_text("size") + cbor_uint(len(payload))
+    body += cbor_text("data") + cbor_bytes(payload) + b"\xff"
+    return body + evo_checksum(body).to_bytes(2, "big")
+
+
+def evo_python_type_for_os(version):
+    """7.0.x needs type 15; 7.1+ (including later majors) needs type 18."""
+    if not isinstance(version, str):
+        return None
+    parts = version.split(".")
+    if len(parts) != 4 or any(not p or not p.isascii() or not p.isdecimal()
+                              or len(p) > 5 for p in parts):
+        return None
+    parts = tuple(map(int, parts))
+    if max(parts) > 65535 or parts[0] < 7:
+        return None
+    return 15 if parts[:2] == (7, 0) else 18
+
+
 def _put_var_file_to_target(path, data, archive):
     memtarget = 1 if archive else 0
     _put_request(f"hh01/xfr/var?memtarget={memtarget}&policy=1", data)
@@ -1327,6 +1424,35 @@ def send_var_file(path, target="auto"):
     if target not in ("auto", "ram", "archive"):
         raise ValueError("target must be auto, ram, or archive")
 
+    var_type = evo_file_type(data)
+    if var_type == 18 or evo_python_module(data) is not None:
+        try:
+            info = get_device_info()
+        except (RuntimeError, OSError, ValueError) as error:
+            if is_raw_transfer_error(str(error), ("CN", "QU")):
+                raise
+            info = {}
+        desired_type = evo_python_type_for_os(info.get("pkg-version"))
+        if desired_type is not None and desired_type != var_type:
+            converted = repackage_python_module(data)
+            if converted is not None:
+                print(f"Repackaging bytecode as .{EVO_TYPE_EXTENSIONS[desired_type]} for Evo OS {info['pkg-version']}")
+                data = converted
+        # Both bytecode containers are Archive-only, even with an explicit RAM
+        # target. A rejected wrapper gets just one retry in the other format.
+        try:
+            _put_var_file_to_target(path, data, archive=True)
+        except RuntimeError as error:
+            if not is_raw_transfer_error(str(error), ("DP",)):
+                raise
+            converted = repackage_python_module(data)
+            if converted is None:
+                raise
+            extension = EVO_TYPE_EXTENSIONS[evo_file_type(converted)]
+            print(f"Calculator rejected the bytecode wrapper (DP); retrying as .{extension} in Archive")
+            _put_var_file_to_target(path, converted, archive=True)
+        return
+
     if target == "ram":
         _put_var_file_to_target(path, data, archive=False)
         return
@@ -1334,7 +1460,6 @@ def send_var_file(path, target="auto"):
         _put_var_file_to_target(path, data, archive=True)
         return
 
-    var_type = evo_file_type(data)
     if var_type in (4, 5):
         _put_var_file_to_target(path, data, archive=True)
         return
