@@ -750,6 +750,8 @@ def evo_python_transfer_name_words(name):
     for c in name.upper():
         if "A" <= c <= "Z":
             words.append(0xE800 + ord(c) - ord("A"))
+        elif c == "_":
+            words.append(0x0E400)
         elif c == "Θ":
             words.append(EVO_CUSTOM_NAME_THETA)
         elif "0" <= c <= "9":
@@ -761,7 +763,7 @@ def evo_python_transfer_name_words(name):
 
 def is_valid_evo_python_name(name):
     return 1 <= len(name) <= 8 and all(
-        ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "θΘ"
+        ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "θΘ" or c == '_'
         for c in name
     )
 
